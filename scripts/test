@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Ground-truth test runner (see SPECS/TECH.md). Usage: scripts/test [pytest args...]
+set -euo pipefail
+cd "$(dirname "$0")/.."
+python3 -m pytest "$@"

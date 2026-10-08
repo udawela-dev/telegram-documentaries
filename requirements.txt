@@ -1,0 +1,8 @@
+# Pinned, reproducible dependencies for Phase 1 (gateway + long polling).
+# Install with: pip install -r requirements.txt
+httpx==0.28.1
+pydantic==2.13.5
+python-dotenv==1.0.1
+
+# Dev / test
+pytest==8.3.3

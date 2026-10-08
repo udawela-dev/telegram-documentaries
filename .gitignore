@@ -1,4 +1,4 @@
-# Secrets — never commit (see SPECS/MISSION.md non-negotiables)
+# SECRETS — never commit (see SPECS/MISSION.md non-negotiables)
 .env
 
 # Python
@@ -7,6 +7,7 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+.pytest_cache/
 
 # Generated media / temp state
 *.ogg
