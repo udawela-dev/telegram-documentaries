@@ -1,8 +1,11 @@
-"""Phase 1 gateway: long-polling loop + dispatcher (plan task 6).
+"""Phase 1+2 gateway: long-polling loop + dispatcher (Bouncer gate since Phase 2).
 
 Behaviour contract:
-* every message channel gets the SAME hardcoded reply — no state, no
-  branching on content;
+* every TEXT message gets the confirmation reply — no state, no branching;
+* every PHOTO message passes through The Bouncer gate (Phase 2): approved →
+  the confirmation reply is sent unchanged; rejected → cheeky rejection and
+  the chat's ephemeral state is reset; download/classify failures → graceful
+  reply, no reset, loop survives;
 * ``offset`` advances after each update is processed OR attempted, so no
   update is ever reprocessed;
 * a failing poll or a failing reply never kills the loop (fail loudly,
@@ -14,7 +17,8 @@ from __future__ import annotations
 import logging
 import threading
 
-from src.telegram_models import TelegramAPIError, Update
+from src.bouncer import BOUNCER_REJECTION, BOUNCER_UNAVAILABLE_REPLY
+from src.telegram_models import Message, TelegramAPIError, Update
 
 logger = logging.getLogger(__name__)
 
@@ -26,11 +30,13 @@ class Gateway:
         self,
         client,
         *,
+        bouncer=None,
         reply_text: str = REPLY_TEXT,
         poll_timeout: int = 30,
         backoff_seconds: float = 0.5,
     ) -> None:
         self._client = client
+        self._bouncer = bouncer
         self._reply_text = reply_text
         self._poll_timeout = poll_timeout
         self._backoff_seconds = backoff_seconds
@@ -90,6 +96,8 @@ class Gateway:
             )
             return False
         chat_id = update.message.chat.id
+        if update.message.photo:
+            return self._handle_photo(update.message, chat_id, update.update_id)
         self._client.send_message(chat_id, self._reply_text)
         logger.info(
             "event=reply_sent update_id=%d chat_id=%s text=%r",
@@ -97,6 +105,72 @@ class Gateway:
             chat_id,
             self._reply_text,
         )
+        return True
+
+    def _handle_photo(self, message: Message, chat_id: int, update_id: int) -> bool:
+        """Phase 2 gate: photo uploads → The Bouncer.
+
+        Approved → confirmation flow unchanged. Rejected → cheeky rejection +
+        ephemeral chat state reset. Failure at any step → graceful reply, no
+        reset, loop survives.
+        """
+        if self._bouncer is None:
+            logger.error(
+                "event=photo_no_bouncer chat_id=%s update_id=%d", chat_id, update_id
+            )
+            self._client.send_message(chat_id, BOUNCER_UNAVAILABLE_REPLY)
+            return True
+        if not message.photo:
+            logger.error(
+                "event=photo_empty chat_id=%s update_id=%d", chat_id, update_id
+            )
+            self._client.send_message(chat_id, BOUNCER_UNAVAILABLE_REPLY)
+            return True
+        try:
+            largest = max(message.photo, key=lambda p: p.width * p.height)
+            file_info = self._client.get_file(largest.file_id)
+            if file_info.file_path is None:
+                raise TelegramAPIError("getFile returned no file_path")
+            image_bytes = self._client.download_file(file_info.file_path)
+        except TelegramAPIError:
+            logger.exception(
+                "event=photo_download_failed chat_id=%s update_id=%d", chat_id, update_id
+            )
+            self._client.send_message(chat_id, BOUNCER_UNAVAILABLE_REPLY)
+            return True
+
+        try:
+            decision = self._bouncer.classify(image_bytes, chat_id)
+        except Exception:
+            logger.exception(
+                "event=photo_classify_failed chat_id=%s update_id=%d", chat_id, update_id
+            )
+            self._client.send_message(chat_id, BOUNCER_UNAVAILABLE_REPLY)
+            return True
+
+        if decision.human_present:
+            logger.info(
+                "event=photo_approved update_id=%d chat_id=%s reason=%r",
+                update_id,
+                chat_id,
+                decision.reason,
+            )
+            self._client.send_message(chat_id, self._reply_text)
+            return True
+
+        logger.info(
+            "event=photo_rejected update_id=%d chat_id=%s reason=%r",
+            update_id,
+            chat_id,
+            decision.reason,
+        )
+        self._client.send_message(chat_id, BOUNCER_REJECTION)
+        try:
+            self._bouncer.reset_chat(chat_id)
+        except Exception:
+            logger.exception(
+                "event=bouncer_session_reset_failed chat_id=%s", chat_id
+            )
         return True
 
     def run(self, stop_event: threading.Event) -> None:

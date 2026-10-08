@@ -15,7 +15,9 @@ from src.telegram_models import (
     MalformedResponseError,
     Message,
     TelegramAPIError,
+    TelegramFile,
     Update,
+    parse_file,
     parse_updates,
 )
 
@@ -220,3 +222,146 @@ def test_message_without_text_is_valid_model():
 def test_chat_id_must_be_an_integer():
     with pytest.raises(ValidationError):
         Chat(id="4242")
+
+
+# --- photo messages (Phase 2 — The Bouncer) ------------------------------------
+
+
+def test_photo_message_parses_typed_photo_sizes():
+    updates = parse_updates(
+        {
+            "ok": True,
+            "result": [
+                {
+                    "update_id": 101,
+                    "message": {
+                        "message_id": 9,
+                        "chat": {"id": 4242, "type": "private"},
+                        "date": 1700000000,
+                        "photo": [
+                            {
+                                "file_id": "small-file-id",
+                                "file_unique_id": "u-small",
+                                "width": 90,
+                                "height": 120,
+                                "file_size": 4000,
+                            },
+                            {
+                                "file_id": "big-file-id",
+                                "file_unique_id": "u-big",
+                                "width": 360,
+                                "height": 480,
+                                "file_size": 64000,
+                            },
+                        ],
+                    },
+                }
+            ],
+        }
+    )
+
+    message = updates[0].message
+    assert message is not None
+    assert isinstance(message.photo, list)
+    assert [(p.file_id, p.width, p.height, p.file_size) for p in message.photo] == [
+        ("small-file-id", 90, 120, 4000),
+        ("big-file-id", 360, 480, 64000),
+    ]
+    assert message.text is None
+
+
+def test_photo_message_keeps_any_text_alongside_the_photo():
+    updates = parse_updates(
+        {
+            "ok": True,
+            "result": [
+                {
+                    "update_id": 102,
+                    "message": {
+                        "message_id": 10,
+                        "chat": {"id": 5, "type": "private"},
+                        "text": "capture me",
+                        "photo": [
+                            {"file_id": "f1", "file_unique_id": "u1", "width": 10, "height": 10}
+                        ],
+                    },
+                }
+            ],
+        }
+    )
+
+    message = updates[0].message
+    assert message is not None
+    assert message.text == "capture me"
+    assert message.photo is not None and len(message.photo) == 1
+
+
+def test_text_message_has_no_photo():
+    updates = parse_updates({"ok": True, "result": [VALID_UPDATE]})
+
+    assert updates[0].message is not None
+    assert updates[0].message.photo is None
+
+
+def test_photo_sizes_missing_file_id_are_skipped_with_log(caplog):
+    with caplog.at_level(logging.WARNING):
+        updates = parse_updates(
+            {
+                "ok": True,
+                "result": [
+                    {
+                        "update_id": 103,
+                        "message": {
+                            "message_id": 11,
+                            "chat": {"id": 3, "type": "private"},
+                            "photo": [{"file_unique_id": "u", "width": 10, "height": 10}],
+                        },
+                    }
+                ],
+            }
+        )
+
+    assert updates == []  # the update as a whole was malformed → skipped
+    assert any("skip_update" in r.message for r in caplog.records)
+
+
+# --- getFile boundary (Phase 2) -------------------------------------------------
+
+
+def test_parse_file_valid_result_returns_typed_file():
+    parsed = parse_file(
+        {"ok": True, "result": {"file_id": "f1", "file_unique_id": "u1", "file_size": 1234, "file_path": "photos/x.jpg"}}
+    )
+
+    assert isinstance(parsed, TelegramFile)
+    assert parsed.file_id == "f1"
+    assert parsed.file_path == "photos/x.jpg"
+    assert parsed.file_size == 1234
+
+
+def test_parse_file_tolerates_missing_file_path():
+    parsed = parse_file({"ok": True, "result": {"file_id": "f1"}})
+
+    assert parsed.file_path is None
+
+
+def test_parse_file_ok_false_raises_telegram_api_error():
+    with pytest.raises(TelegramAPIError) as excinfo:
+        parse_file({"ok": False, "error_code": 400, "description": "Bad Request: file not found"})
+
+    assert "file not found" in str(excinfo.value)
+
+
+def test_parse_file_invalid_result_raises_malformed():
+    with pytest.raises(MalformedResponseError):
+        parse_file({"ok": True, "result": {"file_path": "no-file-id"}})
+
+    for bad in (None, "x", 42, [], {}):
+        with pytest.raises(MalformedResponseError):
+            parse_file({"ok": True, "result": bad})
+
+
+def test_parse_file_non_mapping_payload_raises():
+    for bad in (None, ["x"], "text", 42):
+        with pytest.raises(MalformedResponseError):
+            parse_file(bad)

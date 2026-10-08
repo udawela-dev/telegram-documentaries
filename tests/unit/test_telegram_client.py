@@ -12,7 +12,12 @@ import httpx
 import pytest
 
 from src.telegram_client import TelegramClient
-from src.telegram_models import MalformedResponseError, TelegramAPIError, Update
+from src.telegram_models import (
+    MalformedResponseError,
+    TelegramAPIError,
+    TelegramFile,
+    Update,
+)
 
 TOKEN = "TEST-TOKEN-123"
 
@@ -218,3 +223,91 @@ def test_send_message_network_error_raises_redacted(caplog):
 def test_client_rejects_blank_token():
     with pytest.raises(ValueError):
         TelegramClient("   ", transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
+
+
+# --- getFile / download (Phase 2 — The Bouncer) ---------------------------------
+
+
+def test_get_file_requests_file_id_and_returns_typed_file():
+    captured = {}
+
+    def handler(request):
+        captured["path"] = request.url.path
+        captured["params"] = dict(request.url.params)
+        return httpx.Response(
+            200,
+            json={"ok": True, "result": {"file_id": "f1", "file_path": "photos/abc.jpg", "file_size": 99}},
+        )
+
+    parsed = _client(handler).get_file("f1")
+
+    assert captured["path"] == f"/bot{TOKEN}/getFile"
+    assert captured["params"] == {"file_id": "f1"}
+    assert isinstance(parsed, TelegramFile)
+    assert parsed.file_path == "photos/abc.jpg"
+
+
+def test_get_file_ok_false_raises_redacted():
+    def handler(request):
+        return httpx.Response(200, json={"ok": False, "description": "Bad Request: wrong file identifier"})
+
+    with pytest.raises(TelegramAPIError) as excinfo:
+        _client(handler).get_file("f1")
+
+    assert "wrong file identifier" in str(excinfo.value)
+    assert TOKEN not in str(excinfo.value)
+
+
+def test_get_file_network_error_raises_redacted(caplog):
+    def handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(TelegramAPIError) as excinfo:
+            _client(handler).get_file("f1")
+
+    assert TOKEN not in str(excinfo.value)
+    assert TOKEN not in caplog.text
+
+
+def test_download_file_fetches_raw_bytes_from_file_endpoint():
+    captured = {}
+
+    def handler(request):
+        captured["path"] = request.url.path
+        return httpx.Response(200, content=b"\xff\xd8image-bytes")
+
+    client = _client(handler)
+    content = client.download_file("photos/abc.jpg")
+
+    assert captured["path"] == f"/file/bot{TOKEN}/photos/abc.jpg"
+    assert content == b"\xff\xd8image-bytes"
+
+
+def test_download_file_http_error_raises_redacted(caplog):
+    def handler(request):
+        return httpx.Response(500, text="boom")
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(TelegramAPIError) as excinfo:
+            _client(handler).download_file("photos/abc.jpg")
+
+    assert TOKEN not in str(excinfo.value)
+    assert TOKEN not in caplog.text
+
+
+def test_download_file_network_error_raises_redacted(caplog):
+    def handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(TelegramAPIError) as excinfo:
+            _client(handler).download_file("photos/abc.jpg")
+
+    assert TOKEN not in str(excinfo.value)
+    assert TOKEN not in caplog.text
+
+
+def test_download_file_rejects_empty_path():
+    with pytest.raises(TelegramAPIError):
+        _client(lambda r: httpx.Response(200, content=b"x")).download_file("")

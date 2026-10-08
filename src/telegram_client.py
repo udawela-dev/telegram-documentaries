@@ -11,15 +11,21 @@ scrubbed by the app's log filter) never appears in a log record.
 """
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 import httpx
 from pydantic import BaseModel, ConfigDict, ValidationError
 
 from src.logging_utils import log_call, redact
-from src.telegram_models import TelegramAPIError, Update, parse_updates
+from src.telegram_models import TelegramAPIError, TelegramFile, Update, parse_file, parse_updates
 
 API_BASE_URL = "https://api.telegram.org"
+
+# httpx/httpcore INFO records render the full request URL — which embeds the
+# bot token. Silence them at construction (not only in configure_logging) so
+# a DEBUG capture can never expose the token via these logs.
+_NOISIEST = ("httpx", "httpcore")
 
 
 class SendMessageResponse(BaseModel):
@@ -50,6 +56,11 @@ class TelegramClient:
             timeout=timeout,
             transport=transport,
         )
+        # The raw-file endpoint has NO JSON envelope and a different path
+        # shape (/file/bot<token>/<path>), so it gets its own base.
+        self._file_base_url = f"{base_url}/file/bot{token}"
+        for noisier in _NOISIEST:
+            logging.getLogger(noisier).setLevel(logging.WARNING)
 
     def close(self) -> None:
         self._http.close()
@@ -85,6 +96,33 @@ class TelegramClient:
         if not response.ok:
             detail = f": {response.description}" if response.description else ""
             raise TelegramAPIError(f"sendMessage returned ok=false{detail}")
+
+    @log_call()
+    def get_file(self, file_id: str) -> TelegramFile:
+        """Resolve a file_id to a typed ``TelegramFile`` (with download path)."""
+        payload = self._request("GET", "/getFile", params={"file_id": file_id})
+        return parse_file(payload)
+
+    @log_call()
+    def download_file(self, file_path: str) -> bytes:
+        """Download raw file bytes from the file endpoint (no JSON envelope).
+
+        ``file_path`` comes from a ``TelegramFile``. The bot token is inside
+        the URL, so every failure is redacted into a ``TelegramAPIError``.
+        """
+        if not file_path:
+            raise TelegramAPIError("file download requested with an empty file_path")
+        try:
+            response = self._http.get(f"{self._file_base_url}/{file_path.lstrip('/')}")
+        except httpx.HTTPError as exc:
+            raise TelegramAPIError(
+                redact(f"{type(exc).__name__}: {exc}", self._token)
+            ) from None
+        if response.status_code >= 400:
+            raise TelegramAPIError(
+                redact(f"HTTP {response.status_code} downloading file '{file_path}'", self._token)
+            )
+        return response.content
 
     def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         """Execute one API request; every failure becomes a redacted TelegramAPIError."""

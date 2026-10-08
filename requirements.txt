@@ -1,8 +1,12 @@
-# Pinned, reproducible dependencies for Phase 1 (gateway + long polling).
+# Pinned, reproducible dependencies (Phase 1 gateway + Phase 2 Bouncer gate).
 # Install with: pip install -r requirements.txt
 httpx==0.28.1
 pydantic==2.13.5
 python-dotenv==1.0.1
+
+# Phase 2 — Google ADK vision gate (The Bouncer)
+google-adk==2.11.0
+google-genai==2.29.0
 
 # Dev / test
 pytest==8.3.3

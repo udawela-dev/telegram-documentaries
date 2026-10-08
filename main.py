@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Entry point — The Telegram Documentaries, Phase 1 gateway.
+"""Entry point — The Telegram Documentaries, Phase 1 gateway + Phase 2 gate.
 
-Long-polling loop that replies to every message with a hardcoded "Hi Mate".
-No LLM / Gemini calls yet (no API calls just yet).
+Long-polling loop that replies to every text message with the confirmation
+text. Photo uploads pass through **The Bouncer** (an ADK LlmAgent on Gemini
+3.1 Flash Lite): approved photos continue the confirmation flow; non-human
+photos get a cheeky rejection and reset the chat's ephemeral state.
 
 Usage:
     python main.py
@@ -15,6 +17,7 @@ import signal
 import sys
 import threading
 
+from src.bouncer import BOUNCER_MODEL, Bouncer
 from src.config import ConfigError, load_settings
 from src.gateway import Gateway
 from src.logging_utils import configure_logging
@@ -45,8 +48,18 @@ def main() -> int:
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
 
+    # The Bouncer gates photo uploads. It needs a Gemini key — never hardcoded,
+    # always from settings/.env (constitution non-negotiable). Without one the
+    # bot still runs its text flow, but photo uploads get a graceful "can't
+    # look" reply instead of a verdict.
+    bouncer = None
+    if settings.gemini_api_key:
+        bouncer = Bouncer(api_key=settings.gemini_api_key, model=BOUNCER_MODEL)
+    else:
+        logger.warning("event=bouncer_unavailable reason=missing_gemini_api_key")
+
     client = TelegramClient(token=settings.telegram_bot_token)
-    gateway = Gateway(client)
+    gateway = Gateway(client, bouncer=bouncer)
     try:
         gateway.run(stop_event)
     finally:

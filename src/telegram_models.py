@@ -32,11 +32,33 @@ class Chat(BaseModel):
     id: int
 
 
+class PhotoSize(BaseModel):
+    """One Telegram photo size variant (uploads deliver several resolutions)."""
+
+    model_config = ConfigDict(extra="allow", strict=True)
+
+    file_id: str
+    width: int
+    height: int
+    file_size: int | None = None
+
+
 class Message(BaseModel):
     model_config = ConfigDict(extra="allow", strict=True)
 
     chat: Chat
     text: str | None = None
+    photo: list[PhotoSize] | None = None
+
+
+class TelegramFile(BaseModel):
+    """Typed shape of a getFile result (the download path lives here)."""
+
+    model_config = ConfigDict(extra="allow", strict=True)
+
+    file_id: str
+    file_path: str | None = None
+    file_size: int | None = None
 
 
 class Update(BaseModel):
@@ -88,3 +110,30 @@ def _describe_validation_error(exc: ValidationError) -> str:
         location = ".".join(str(part) for part in error["loc"]) or "<root>"
         summaries.append(f"{location}: {error['msg']}")
     return "; ".join(summaries)
+
+
+def parse_file(payload: Any) -> TelegramFile:
+    """Boundary: untrusted getFile JSON → validated ``TelegramFile``.
+
+    Whole-payload problems raise (``MalformedResponseError`` / ok=false →
+    ``TelegramAPIError``); an invalid ``result`` is malformed input, not a
+    silent skip — the caller must not proceed to a download without a valid
+    file descriptor.
+    """
+    if not isinstance(payload, Mapping):
+        raise MalformedResponseError(
+            f"getFile payload must be a JSON object, got {type(payload).__name__}"
+        )
+    if "ok" not in payload:
+        raise MalformedResponseError("getFile payload has no 'ok' field")
+    if payload["ok"] is not True:
+        description = payload.get("description")
+        detail = str(description) if isinstance(description, str) else "Telegram API error"
+        raise TelegramAPIError(f"getFile returned ok=false: {detail}")
+    result = payload.get("result")
+    try:
+        return TelegramFile.model_validate(result)
+    except (ValidationError, TypeError) as exc:
+        raise MalformedResponseError(
+            f"invalid getFile result: {_describe_validation_error(exc) if isinstance(exc, ValidationError) else exc}"
+        ) from None
