@@ -27,16 +27,22 @@ Copy `.env.example` to `.env` and fill in real values:
 | Variable             | Required | Used in Phase 2? |
 | -------------------- | -------- | ---------------- |
 | `TELEGRAM_BOT_TOKEN` | yes      | yes — long polling auth |
-| `GEMINI_API_KEY`     | yes*     | yes — the Bouncer's vision brain |
+| `GEMINI_API_KEY`     | no*      | yes — the Bouncer's vision brain |
 
-\* Without `GEMINI_API_KEY` the bot still runs its text flow; photo uploads get
-a graceful "couldn't get a good look" reply instead of a verdict. If Google
+\* Without `GEMINI_API_KEY` the bot still runs its text flow, and photo
+uploads are still classified — by the **key-free local fallback**. If Google
 reports your key as *leaked* (403 `PERMISSION_DENIED`), it is permanently
 disabled server-side — create a fresh key **in a different project/account**
 and put it in `.env`.
 
-Optional: `BOUNCER_MODEL` overrides the vision model (default
-`gemini-3.1-flash-lite`).
+Optional Bouncer tuning:
+
+| Variable                    | Default | What it does |
+| --------------------------- | ------- | ------------ |
+| `BOUNCER_MODEL`             | `gemini-3.1-flash-lite` | Gemini vision model. |
+| `BOUNCER_GEMINI_TIMEOUT`    | `60`    | Seconds a Gemini verdict may take before falling back to the local detector. |
+| `BOUNCER_FACE_MODEL`        | bundled | Path to the YuNet ONNX model (overrides `src/data/`). |
+| `BOUNCER_YUNET_THRESHOLD`   | `0.3`   | Face-detection confidence floor (0-1). |
 
 Never commit `.env` — it is gitignored. Both secrets are scrubbed from every
 log record by a redaction filter (`src/logging_utils.py`); the httpx/httpcore
@@ -55,7 +61,7 @@ Behaviour:
 | Text | `Hi Mate` |
 | Photo with a human | `Hi Mate` (approved — confirmation flow continues) |
 | Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` (rejected + chat state reset) |
-| Photo when Gemini is unreachable | `Hang on — I couldn't get a good look at that photo…` (graceful; loop survives) |
+| Photo when Gemini is unreachable | **Local fallback verdict**: face detected → `Hi Mate`; no face → rejection. (Only if the local detector fails too does the graceful "Hang on…" reply appear.) |
 
 Stop it with `Ctrl-C` (SIGINT) or SIGTERM — it shuts down gracefully.
 
@@ -80,8 +86,15 @@ the key in `.env`.
 
 `main.py` (entry point) → `src/config.py` (`.env` → validated `Settings`) →
 `src/telegram_client.py` (raw-HTTP httpx client, incl. `getFile` + file
-download for photos) and `src/bouncer.py` (ADK agent + per-chat in-memory
-sessions) → `src/gateway.py` (polling loop + dispatcher + photo gate).
+download for photos) → `src/bouncer.py` (ADK agent + per-chat in-memory
+sessions, with a hard 60s Gemini timeout) + `src/local_vision.py` (key-free
+YuNet face detector, bundled model in `src/data/`) → `src/gateway.py`
+(polling loop + dispatcher + photo gate).
+
+The Bouncer's verdict order: **Gemini (ADK agent) first**; on failure or
+timeout it falls back to the local YuNet detector so a photo always gets a
+real human/non-human answer; only if neither can judge does the gateway reply
+gracefully. Chat state resets stay Gemini-session-based and chat-scoped.
 
 Key rules from `SPECS/` honoured here:
 

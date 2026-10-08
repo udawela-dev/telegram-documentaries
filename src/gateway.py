@@ -96,7 +96,9 @@ class Gateway:
             )
             return False
         chat_id = update.message.chat.id
-        if update.message.photo:
+        # Route on presence of the field, not truthiness: a malformed message
+        # with a photo=[] list must hit the gate, never the text branch.
+        if update.message.photo is not None:
             return self._handle_photo(update.message, chat_id, update.update_id)
         self._client.send_message(chat_id, self._reply_text)
         logger.info(
@@ -133,6 +135,12 @@ class Gateway:
                 raise TelegramAPIError("getFile returned no file_path")
             image_bytes = self._client.download_file(file_info.file_path)
         except TelegramAPIError:
+            logger.exception(
+                "event=photo_download_failed chat_id=%s update_id=%d", chat_id, update_id
+            )
+            self._client.send_message(chat_id, BOUNCER_UNAVAILABLE_REPLY)
+            return True
+        except Exception:
             logger.exception(
                 "event=photo_download_failed chat_id=%s update_id=%d", chat_id, update_id
             )

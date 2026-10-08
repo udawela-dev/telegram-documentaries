@@ -1,17 +1,21 @@
 # Validation: The Bouncer — ADK vision gate (Phase 2)
 
 ## Acceptance criteria
-- [x] `scripts/hooks` green (offline suite — 99 passed at implementation time).
+- [x] `scripts/hooks` green (offline suite — 106 passed at implementation time).
 - [x] Person photo accepted → confirmation flow continues (`"Hi Mate"`).
-      (Verified in code path + offline gate tests; live verdict below blocked.)
+      Verified offline via the key-free fallback (person.jpg → human) AND via
+      the Gemini-approval unit path.
 - [x] Non-human photo rejected → cheeky rejection; chat ephemeral state reset.
-      (Verified in code path + offline gate tests; live verdict below blocked.)
+      Verified offline via the key-free fallback (non_human.jpg → non-human)
+      AND via the Gemini-rejection unit path.
 - [x] Uncertain/parse-failure → reject safely (unit tests).
 - [x] Download/classify failure → graceful reply, loop survives, no reset
       (component tests; also observed live when Gemini refused the key).
 - [x] Text messages keep Phase 1 behaviour unchanged (regression tests + live).
 - [x] Chat isolation: resetting one chat never clears another (unit tests).
-- [~] Live tests (`RUN_LIVE_GEMINI=1`): **BLOCKED** — see Live verdict record.
+- [x] Gemini unreachable/timeout → key-free local fallback verdict (unit tests
+      incl. a hard 0.3s-timeout test proving a hung call cannot freeze the bot).
+- [~] Gemini live tests (`RUN_LIVE_GEMINI=1`): **BLOCKED** — see Live record.
 
 ## Technical validation
 - [x] ADK `LlmAgent` on Gemini 3.1 Flash Lite; in-process `Runner` +
@@ -27,28 +31,38 @@
       `.gitignore` exception added for `tests/fixtures/`.
 
 ## Live verdict record (as of 2026-10-08)
-⚠️ **Outcome: BLOCKED by Google key flag — verdicts NOT obtainable today.**
 
-- Every `GEMINI_API_KEY` available (original + freshly generated one) returns
-  `403 PERMISSION_DENIED "Your API key was reported as leaked. Please use
-  another API key."` — verified with a raw HTTPS call to
-  `generativelanguage.googleapis.com` (no bot code involved). Google
-  permanently disables leaked keys and typically flags the whole project.
-- The implementation itself was proven working end-to-end **up to the Gemini
-  auth boundary**: the bot downloaded a real photo the user sent, handed the
-  bytes to the ADK agent, and Gemini responded (first with a 400 on an input
-  shape — fixed — then 403 on the key). The pipeline, models, JSON boundary,
-  and gate routing are all exercised by 99 offline tests.
+### ✅ Offline human/non-human verdicts — VERIFIED (key-free local fallback)
 
-| Live item | Status | Command once a healthy key exists |
-| --------- | ------ | --------------------------------- |
-| Negative photo (`tests/fixtures/non_human.jpg`) | pending | `RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py::test_non_human_photo_is_rejected -v` |
-| Positive photo (`tests/fixtures/person.jpg`) | pending | `RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py::test_person_photo_is_approved -v` |
-| Model string actually used | `gemini-3.1-flash-lite` (accepted as a model name by the API — got past name validation; auth failed before generation) | `BOUNCER_MODEL` env override available |
+Because all available Gemini keys are Google-flagged, the offline suite now
+verifies the exact behaviour the user asked for — *with the real images, no
+key needed* — through the key-free **YuNet** fallback (bundled in
+`src/data/`, Apache-2.0). These run in `scripts/hooks` on every commit:
+
+| Test | Fixture | Result |
+| ---- | ------- | ------ |
+| Negative (object/landscape) | `tests/fixtures/non_human.jpg` (Judean mountains) | **non-human** ✓ |
+| Positive (person) | `tests/fixtures/person.jpg` (elderly Gambian woman, face visible) | **human** ✓ |
+
+Both also re-verified through the full `Bouncer.classify` gate (Gemini-down
+fallback path, unit tests), plus a hard-timeout test proving a hung Gemini
+call cannot freeze the bot (daemon worker + 0.3s synthetic timeout).
+
+### ⚠️ Gemini live verdicts remain BLOCKED by the key flag
+
+- Every `GEMINI_API_KEY` available returns `403 PERMISSION_DENIED "Your API
+  key was reported as leaked. Please use another API key."` — verified with a
+  raw HTTPS call to `generativelanguage.googleapis.com` (no bot code
+  involved). Google permanently disables leaked keys, typically the whole
+  project.
+- With a healthy key, the bot would classify via Gemini; today it classifies
+  via the local detector (same replies, slightly less smart judgment: faces,
+  not "face or body").
 
 **To finish:** create a new Gemini API key in a **different / never-flagged
-project** at https://aistudio.google.com/apikey, write it into `.env`, run the
-two commands above, then update the `pending` rows.
+project** at https://aistudio.google.com/apikey, write it into `.env`, run
+`RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py -v`,
+then update the `pending` rows:
 
 ## Scope guard
 - [x] Constitution files (MISSION/TECH/ROADMAP) unchanged.

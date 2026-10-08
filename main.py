@@ -6,6 +6,10 @@ text. Photo uploads pass through **The Bouncer** (an ADK LlmAgent on Gemini
 3.1 Flash Lite): approved photos continue the confirmation flow; non-human
 photos get a cheeky rejection and reset the chat's ephemeral state.
 
+When Gemini cannot be reached (missing/blocked API key, network failure,
+timeout) the Bouncer falls back to a key-free OpenCV face detector, so
+photo uploads still get a real human/non-human verdict.
+
 Usage:
     python main.py
 """
@@ -17,9 +21,10 @@ import signal
 import sys
 import threading
 
-from src.bouncer import BOUNCER_MODEL, Bouncer
+from src.bouncer import Bouncer
 from src.config import ConfigError, load_settings
 from src.gateway import Gateway
+from src.local_vision import LocalVisionClassifier
 from src.logging_utils import configure_logging
 from src.telegram_client import TelegramClient
 
@@ -48,15 +53,24 @@ def main() -> int:
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
 
-    # The Bouncer gates photo uploads. It needs a Gemini key — never hardcoded,
-    # always from settings/.env (constitution non-negotiable). Without one the
-    # bot still runs its text flow, but photo uploads get a graceful "can't
-    # look" reply instead of a verdict.
+    # The Bouncer gates photo uploads. Never hardcoded — keys always come from
+    # settings/.env (constitution non-negotiable). The key-free OpenCV face
+    # detector is always wired in as the resilience fallback: if Gemini is
+    # missing or unreachable (blocked key, network, timeout), photo uploads
+    # still get a real human/non-human verdict instead of a dead end.
+    local_vision = LocalVisionClassifier()  # logs event=local_vision_ready/unavailable
     bouncer = None
-    if settings.gemini_api_key:
-        bouncer = Bouncer(api_key=settings.gemini_api_key, model=BOUNCER_MODEL)
+    if settings.gemini_api_key or local_vision.available:
+        # Model is resolved at Bouncer construction (honours a runtime
+        # BOUNCER_MODEL env override).
+        bouncer = Bouncer(
+            api_key=settings.gemini_api_key,
+            local_classifier=local_vision,
+        )
+        if not settings.gemini_api_key:
+            logger.warning("event=bouncer_local_only reason=missing_gemini_api_key")
     else:
-        logger.warning("event=bouncer_unavailable reason=missing_gemini_api_key")
+        logger.warning("event=bouncer_unavailable reason=no_gemini_key_and_no_local_vision")
 
     client = TelegramClient(token=settings.telegram_bot_token)
     gateway = Gateway(client, bouncer=bouncer)

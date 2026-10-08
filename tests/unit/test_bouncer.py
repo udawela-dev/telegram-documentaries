@@ -2,18 +2,28 @@
 
 Offline strategy: the LLM step (``_llm_classify``) is subclassed/scripted so no
 network and no Gemini key are needed. The real behaviour under test is the
-verdict boundary (``parse_decision``) and the per-chat session semantics.
+verdict boundary (``parse_decision``), the per-chat session semantics, and the
+key-free local-fallback wiring (real OpenCV detector, committed fixtures).
 """
+import time
+from pathlib import Path
+
 import pytest
 
+import src.bouncer as bouncer_module
 from src.bouncer import (
     BOUNCER_MODEL,
     BOUNCER_REJECTION,
+    BOUNCER_UNAVAILABLE_REPLY,
     Bouncer,
     parse_decision,
 )
+from src.local_vision import LocalVisionClassifier
 
 APP = "telegram-documentaries"
+FIXTURES = Path(__file__).resolve().parent.parent / "fixtures"
+PERSON_JPEG = (FIXTURES / "person.jpg").read_bytes()
+NON_HUMAN_JPEG = (FIXTURES / "non_human.jpg").read_bytes()
 
 
 # --- parse_decision: boundary of raw agent output ------------------------------
@@ -68,6 +78,45 @@ def test_parse_decision_rejects_safely_when_required_field_missing():
 
 def test_parse_decision_rejects_safely_when_verdict_is_not_bool():
     decision = parse_decision('{"human_present": "maybe", "reason": "x"}')
+
+    assert decision.human_present is False
+
+
+def test_parse_decision_rejects_safely_for_every_uncertain_verdict_value():
+    """Uncertainty is not representable in a strict bool → reject-safe (decision #2)."""
+    for raw in (
+        '{"human_present": null, "reason": "unsure"}',
+        '{"human_present": "uncertain", "reason": "unsure"}',
+        '{"human_present": "maybe", "reason": "unsure"}',
+        '{"human_present": "probably", "reason": "unsure"}',
+    ):
+        assert parse_decision(raw).human_present is False
+
+
+def test_parse_decision_rejects_safely_when_reason_is_not_a_string():
+    decision = parse_decision('{"human_present": true, "reason": 42}')
+
+    assert decision.human_present is False
+
+
+def test_parse_decision_tolerates_extra_model_fields():
+    """Untrusted model output may carry extra keys; never fail a clear verdict."""
+    decision = parse_decision(
+        '{"human_present": true, "reason": "a clear face", "confidence": 0.97, "tags": ["person"]}'
+    )
+
+    assert decision.human_present is True
+    assert decision.reason == "a clear face"
+
+
+def test_parse_decision_extracts_json_embedded_in_prose():
+    decision = parse_decision('Sure! {"human_present": false, "reason": "just a dog"} hope that helps')
+
+    assert decision.human_present is False
+
+
+def test_parse_decision_rejects_uncertain_prose_safely():
+    decision = parse_decision("I'm not sure whether that is a person or a statue.")
 
     assert decision.human_present is False
 
@@ -169,11 +218,120 @@ def test_reset_chat_for_unknown_chat_is_a_noop():
 
 
 def test_rejection_copy_is_locked():
-    assert BOUNCER_REJECTION.startswith(
-        "Oi! 📸 No monsters, no sunsets, and definitely no last night's lasagna."
+    assert BOUNCER_REJECTION == (
+        "Oi! 📸 No monsters, no sunsets, and definitely no last night's lasagna. "
+        "I only do *humans* — a face, a torso, a faintly smug grin. "
+        "Send me a picture of a person, mate."
     )
-    assert "*humans*" in BOUNCER_REJECTION
+
+
+def test_unavailable_reply_copy_is_locked():
+    assert BOUNCER_UNAVAILABLE_REPLY == (
+        "Hang on — I couldn't get a good look at that photo. Mind sending it again?"
+    )
 
 
 def test_default_model_is_gemini_flash_lite():
-    assert "gemini-3.1-flash-lite" in BOUNCER_MODEL
+    assert BOUNCER_MODEL == "gemini-3.1-flash-lite"
+
+
+def test_resolve_model_uses_default_when_env_absent(monkeypatch):
+    monkeypatch.delenv("BOUNCER_MODEL", raising=False)
+
+    assert bouncer_module.resolve_model() == "gemini-3.1-flash-lite"
+
+
+def test_resolve_model_honours_env_override(monkeypatch):
+    monkeypatch.setenv("BOUNCER_MODEL", "gemini-9.9-test-override")
+
+    assert bouncer_module.resolve_model() == "gemini-9.9-test-override"
+
+
+# --- key-free local fallback (real OpenCV detector, committed fixtures) --------
+
+
+class RaisingBouncer(Bouncer):
+    """Bouncer whose LLM step always fails — models Gemini being unreachable."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.llm_calls = 0
+
+    def _llm_classify(self, image_bytes: bytes, session_id: str, mime_type: str) -> str:
+        self.llm_calls += 1
+        raise RuntimeError("genai down")
+
+
+class SpyBouncer(Bouncer):
+    """Records LLM invocations so tests can prove Gemini was skipped."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.llm_calls = 0
+
+    def _llm_classify(self, image_bytes: bytes, session_id: str, mime_type: str) -> str:
+        self.llm_calls += 1
+        return '{"human_present": true, "reason": "unexpected llm call"}'
+
+
+@pytest.fixture(scope="module")
+def local_classifier() -> LocalVisionClassifier:
+    detector = LocalVisionClassifier()
+    if not detector.available:
+        pytest.skip("Haar cascades unavailable (opencv data missing)")
+    return detector
+
+
+def test_gemini_failure_falls_back_to_local_human_verdict(local_classifier, monkeypatch):
+    """Gemini down + person photo → local detector says human, no crash."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    bouncer = RaisingBouncer(api_key="x", local_classifier=local_classifier)
+
+    decision = bouncer.classify(PERSON_JPEG, chat_id=901)
+
+    assert decision.human_present is True
+    assert "local" in decision.reason
+    assert bouncer.llm_calls == 1  # Gemini WAS attempted before falling back
+
+
+def test_gemini_failure_falls_back_to_local_non_human_verdict(local_classifier, monkeypatch):
+    """Gemini down + landscape photo → local detector says non-human."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    bouncer = RaisingBouncer(api_key="x", local_classifier=local_classifier)
+
+    decision = bouncer.classify(NON_HUMAN_JPEG, chat_id=902)
+
+    assert decision.human_present is False
+    assert "non-human" in decision.reason
+
+
+def test_local_only_mode_skips_gemini_entirely(local_classifier, monkeypatch):
+    """No Gemini key + fallback wired → judged locally, LLM never called."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    bouncer = SpyBouncer(api_key=None, local_classifier=local_classifier)
+
+    decision = bouncer.classify(PERSON_JPEG, chat_id=903)
+
+    assert decision.human_present is True
+    assert bouncer.llm_calls == 0  # keyless round-trip avoided
+
+
+def test_gemini_timeout_falls_back_to_local(local_classifier, monkeypatch):
+    """A hung Gemini call (observed with flagged keys) must NOT freeze the bot."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    monkeypatch.setenv("BOUNCER_GEMINI_TIMEOUT", "0.3")
+
+    class HangingBouncer(Bouncer):
+        def _llm_classify(self, image_bytes: bytes, session_id: str, mime_type: str) -> str:
+            time.sleep(5)
+            return '{"human_present": true, "reason": "late"}'
+
+    bouncer = HangingBouncer(api_key="x", local_classifier=local_classifier)
+    started = time.monotonic()
+
+    decision = bouncer.classify(PERSON_JPEG, chat_id=904)
+
+    elapsed = time.monotonic() - started
+    assert decision.human_present is True
+    assert "local" in decision.reason
+    assert elapsed < 4  # bounded by the 0.3s timeout, not the 5s sleep

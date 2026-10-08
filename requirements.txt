@@ -8,5 +8,10 @@ python-dotenv==1.0.1
 google-adk==2.11.0
 google-genai==2.29.0
 
+# Phase 2 resilience — key-free local face detection fallback. cv2 4.x ships
+# the Haar cascade XMLs; 5.x wheels dropped them, hence the pin.
+opencv-python-headless==4.10.0.84
+numpy==2.2.2
+
 # Dev / test
 pytest==8.3.3

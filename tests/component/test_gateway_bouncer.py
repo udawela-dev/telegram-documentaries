@@ -183,6 +183,7 @@ def test_photo_download_failure_replies_unavailable_and_skips_bouncer(caplog):
     assert replied == 1
     assert client.sent == [(888, BOUNCER_UNAVAILABLE_REPLY)]
     assert bouncer.classify_calls == []  # gate stopped before the LLM
+    assert bouncer.resets == []  # a failure never resets state (decision #4)
     assert any("event=photo_download_failed" in r.message for r in caplog.records)
 
 
@@ -200,6 +201,42 @@ def test_photo_get_file_without_path_treated_as_download_failure():
     assert replied == 1
     assert client.sent == [(999, BOUNCER_UNAVAILABLE_REPLY)]
     assert bouncer.classify_calls == []
+    assert bouncer.resets == []
+
+
+def test_empty_photo_list_is_gated_not_approved_as_text():
+    """A malformed photo message must not sneak through the gate as a text reply."""
+    client = GateClient()
+    bouncer = FakeBouncer(verdicts=[])
+    client.queue([Update(update_id=15, message=Message(chat=Chat(id=1515), photo=[]))])
+
+    replied = _poll(Gateway(client, bouncer=bouncer))
+
+    assert replied == 1
+    assert client.sent == [(1515, BOUNCER_UNAVAILABLE_REPLY)]
+    assert bouncer.classify_calls == []
+    assert bouncer.resets == []
+
+
+def test_unexpected_download_failure_still_replies_gracefully(caplog):
+    """A non-Telegram error from the download must still degrade gracefully."""
+
+    class ExplodingDownloadClient(GateClient):
+        def download_file(self, file_path: str) -> bytes:
+            raise RuntimeError("unexpected transport bug")
+
+    client = ExplodingDownloadClient()
+    bouncer = FakeBouncer(verdicts=[True])
+    client.queue([_photo_update(16, chat_id=1616, sizes=[("f", 100, 100)])])
+
+    with caplog.at_level(logging.ERROR):
+        replied = _poll(Gateway(client, bouncer=bouncer))
+
+    assert replied == 1
+    assert client.sent == [(1616, BOUNCER_UNAVAILABLE_REPLY)]
+    assert bouncer.classify_calls == []
+    assert bouncer.resets == []
+    assert any("event=photo_download_failed" in r.message for r in caplog.records)
 
 
 def test_photo_classify_failure_replies_unavailable_without_reset(caplog):
