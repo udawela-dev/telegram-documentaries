@@ -3,9 +3,11 @@
 Behaviour contract:
 * every TEXT message gets the confirmation reply — no state, no branching;
 * every PHOTO message passes through The Bouncer gate (Phase 2): approved →
-  the confirmation reply is sent unchanged; rejected → cheeky rejection and
-  the chat's ephemeral state is reset; download/classify failures → graceful
-  reply, no reset, loop survives;
+  the confirmation reply is sent unchanged, then a second message announces
+  the verdict ("Human detected ✓"); rejected → cheeky rejection, then a
+  second message ("Non-human detected"), and the chat's ephemeral state is
+  reset; download/classify failures → graceful reply, no reset, loop
+  survives;
 * ``offset`` advances after each update is processed OR attempted, so no
   update is ever reprocessed;
 * a failing poll or a failing reply never kills the loop (fail loudly,
@@ -17,7 +19,12 @@ from __future__ import annotations
 import logging
 import threading
 
-from src.bouncer import BOUNCER_REJECTION, BOUNCER_UNAVAILABLE_REPLY
+from src.bouncer import (
+    BOUNCER_REJECTION,
+    BOUNCER_UNAVAILABLE_REPLY,
+    HUMAN_VERDICT_REPLY,
+    NON_HUMAN_VERDICT_REPLY,
+)
 from src.telegram_models import Message, TelegramAPIError, Update
 
 logger = logging.getLogger(__name__)
@@ -164,6 +171,12 @@ class Gateway:
                 decision.reason,
             )
             self._client.send_message(chat_id, self._reply_text)
+            self._client.send_message(chat_id, HUMAN_VERDICT_REPLY)
+            logger.info(
+                "event=photo_verdict_sent update_id=%d chat_id=%s verdict=human",
+                update_id,
+                chat_id,
+            )
             return True
 
         logger.info(
@@ -173,6 +186,12 @@ class Gateway:
             decision.reason,
         )
         self._client.send_message(chat_id, BOUNCER_REJECTION)
+        self._client.send_message(chat_id, NON_HUMAN_VERDICT_REPLY)
+        logger.info(
+            "event=photo_verdict_sent update_id=%d chat_id=%s verdict=non_human",
+            update_id,
+            chat_id,
+        )
         try:
             self._bouncer.reset_chat(chat_id)
         except Exception:

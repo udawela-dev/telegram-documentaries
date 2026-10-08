@@ -56,12 +56,12 @@ python main.py
 
 Behaviour:
 
-| You send | Bot reply |
+| You send | Bot replies |
 | -------- | --------- |
 | Text | `Hi Mate` |
-| Photo with a human | `Hi Mate` (approved — confirmation flow continues) |
-| Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` (rejected + chat state reset) |
-| Photo when Gemini is unreachable | **Local fallback verdict**: face detected → `Hi Mate`; no face → rejection. (Only if the local detector fails too does the graceful "Hang on…" reply appear.) |
+| Photo with a human | `Hi Mate` then **`Human detected ✓`** (approved — confirmation flow continues) |
+| Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` then **`Non-human detected`** (rejected + chat state reset) |
+| Photo when Gemini is unreachable | **Local fallback verdict**: face detected → human verdict; no face → non-human verdict. (Only if the local detector fails too does the graceful "Hang on…" reply appear.) |
 
 Stop it with `Ctrl-C` (SIGINT) or SIGTERM — it shuts down gracefully.
 

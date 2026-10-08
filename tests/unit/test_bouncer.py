@@ -15,6 +15,8 @@ from src.bouncer import (
     BOUNCER_MODEL,
     BOUNCER_REJECTION,
     BOUNCER_UNAVAILABLE_REPLY,
+    HUMAN_VERDICT_REPLY,
+    NON_HUMAN_VERDICT_REPLY,
     Bouncer,
     parse_decision,
 )
@@ -229,6 +231,11 @@ def test_unavailable_reply_copy_is_locked():
     assert BOUNCER_UNAVAILABLE_REPLY == (
         "Hang on — I couldn't get a good look at that photo. Mind sending it again?"
     )
+
+
+def test_verdict_reply_copies_are_locked():
+    assert HUMAN_VERDICT_REPLY == "Human detected ✓"
+    assert NON_HUMAN_VERDICT_REPLY == "Non-human detected"
 
 
 def test_default_model_is_gemini_flash_lite():

@@ -7,7 +7,13 @@ import logging
 
 import pytest
 
-from src.bouncer import BouncerDecision, BOUNCER_REJECTION, BOUNCER_UNAVAILABLE_REPLY
+from src.bouncer import (
+    BOUNCER_REJECTION,
+    BOUNCER_UNAVAILABLE_REPLY,
+    BouncerDecision,
+    HUMAN_VERDICT_REPLY,
+    NON_HUMAN_VERDICT_REPLY,
+)
 from src.gateway import Gateway, REPLY_TEXT
 from src.telegram_models import Chat, Message, PhotoSize, TelegramAPIError, TelegramFile, Update
 
@@ -95,7 +101,7 @@ def test_photo_approved_continues_confirmation_flow():
     replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(111, REPLY_TEXT)]  # unchanged confirmation flow
+    assert client.sent == [(111, REPLY_TEXT), (111, HUMAN_VERDICT_REPLY)]  # flow + verdict
     assert client.get_file_calls == ["big"]  # largest size chosen
     assert bouncer.classify_calls == [(len(b"image-bytes"), 111)]
     assert bouncer.resets == []
@@ -109,7 +115,7 @@ def test_photo_rejected_sends_cheeky_rejection_and_resets_chat():
     replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(222, BOUNCER_REJECTION)]
+    assert client.sent == [(222, BOUNCER_REJECTION), (222, NON_HUMAN_VERDICT_REPLY)]
     assert bouncer.resets == [222]
 
 
@@ -126,7 +132,7 @@ def test_rejection_resets_only_the_rejected_chat():
     _poll(Gateway(client, bouncer=bouncer))
 
     assert bouncer.resets == [333]  # chat 444 untouched
-    assert client.sent == [(333, BOUNCER_REJECTION), (444, REPLY_TEXT)]
+    assert client.sent == [(333, BOUNCER_REJECTION), (333, NON_HUMAN_VERDICT_REPLY), (444, REPLY_TEXT), (444, HUMAN_VERDICT_REPLY)]
 
 
 def test_text_messages_keep_phase1_behaviour_with_bouncer_present():
@@ -154,7 +160,7 @@ def test_photo_with_caption_is_gated_not_replied_to_directly():
     _poll(Gateway(client, bouncer=bouncer))
 
     assert bouncer.classify_calls == [(len(b"image-bytes"), 666)]
-    assert client.sent == [(666, REPLY_TEXT)]
+    assert client.sent == [(666, REPLY_TEXT), (666, HUMAN_VERDICT_REPLY)]
 
 
 # --- degradation paths ---------------------------------------------------------
@@ -266,7 +272,7 @@ def test_reset_failure_never_hides_the_rejection_or_kills_the_loop(caplog):
         replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(1111, BOUNCER_REJECTION)]
+    assert client.sent == [(1111, BOUNCER_REJECTION), (1111, NON_HUMAN_VERDICT_REPLY)]
     assert any("event=bouncer_session_reset_failed" in r.message for r in caplog.records)
 
 

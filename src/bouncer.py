@@ -72,6 +72,13 @@ BOUNCER_UNAVAILABLE_REPLY = (
     "Hang on — I couldn't get a good look at that photo. Mind sending it again?"
 )
 
+# Two-message verdict announcement (user decision 2026-10-08): the flow reply
+# (approval "Hi Mate" / cheeky rejection) is sent unchanged first, then a
+# second message states the verdict explicitly — "Human detected" / "Non-human
+# detected" — so the user always sees the classification result in the chat.
+HUMAN_VERDICT_REPLY = "Human detected ✓"
+NON_HUMAN_VERDICT_REPLY = "Non-human detected"
+
 INSTRUCTION = (
     "You are The Bouncer, the front gate of a wildlife-documentary Telegram bot. "
     "A user has uploaded a photograph. Classify whether the image contains at "
