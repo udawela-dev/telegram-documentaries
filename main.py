@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Entry point — The Telegram Documentaries, Phase 1 gateway + Phase 2 gate.
+"""Entry point — The Telegram Documentaries, Phases 1–3.
 
 Long-polling loop that replies to every text message with the confirmation
-text. Photo uploads pass through **The Bouncer** (an ADK LlmAgent on Gemini
-3.1 Flash Lite): approved photos continue the confirmation flow; non-human
-photos get a cheeky rejection and reset the chat's ephemeral state.
+text while idle. Photo uploads pass through **The Bouncer** (an ADK LlmAgent on
+Gemini 3.1 Flash Lite): approved photos continue into **The Interviewer**, a
+stateful seven-question documentary interview whose answers build a behavioural
+profile plus a suggested animal; non-human photos get a cheeky rejection and
+reset the chat's ephemeral state.
 
 When Gemini cannot be reached (missing/blocked API key, network failure,
-timeout) the Bouncer falls back to a key-free OpenCV face detector, so
-photo uploads still get a real human/non-human verdict.
+timeout) the Bouncer falls back to a key-free OpenCV face detector, so photo
+uploads still get a real human/non-human verdict. The Interviewer's questions
+and profile builder are deterministic and local, so the interview works offline
+regardless of the Gemini key — the ADK agent is wired as the backbone for later
+stages.
 
 Usage:
     python main.py
@@ -24,6 +29,8 @@ import threading
 from src.bouncer import Bouncer
 from src.config import ConfigError, load_settings
 from src.gateway import Gateway
+from src.interview_state import InterviewStateStore
+from src.interviewer import Interviewer
 from src.local_vision import LocalVisionClassifier
 from src.logging_utils import configure_logging
 from src.telegram_client import TelegramClient
@@ -72,8 +79,16 @@ def main() -> int:
     else:
         logger.warning("event=bouncer_unavailable reason=no_gemini_key_and_no_local_vision")
 
+    # The Interviewer owns the per-chat interview state machine. Its questions
+    # and profile/animal builder are deterministic and local (Gemini-key-free),
+    # so the interview works in Telegram today; the ADK agent is wired as the
+    # backbone for later stages. One shared state store is passed in and used
+    # by the gateway for all reads/writes (TECH.md: one shared state driver).
+    interview_store = InterviewStateStore()
+    interviewer = Interviewer(api_key=settings.gemini_api_key, store=interview_store)
+
     client = TelegramClient(token=settings.telegram_bot_token)
-    gateway = Gateway(client, bouncer=bouncer)
+    gateway = Gateway(client, bouncer=bouncer, interviewer=interviewer)
     try:
         gateway.run(stop_event)
     finally:

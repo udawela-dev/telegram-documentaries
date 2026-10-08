@@ -3,7 +3,7 @@
 Send a portrait to a Telegram bot and receive a narrated, comedy-wildlife
 documentary about yourself.
 
-**Current state: Phases 1 + 2.**
+**Current state: Phases 1 + 2 + 3.**
 
 - **Phase 1 — the gateway.** A long-polling loop (`src/gateway.py`) that
   replies to text messages with `"Hi Mate"`.
@@ -11,6 +11,14 @@ documentary about yourself.
   (`src/bouncer.py`): an ADK `LlmAgent` on **Gemini 3.1 Flash Lite** that
   classifies an uploaded photo — does it contain a clearly discernible human
   face or body?
+- **Phase 3 — The Interviewer.** The stateful orchestrator
+  (`src/interviewer.py` + the shared per-chat state driver
+  `src/interview_state.py`): after a human photo is approved it asks seven
+  documentary-style questions, one at a time, and builds a behavioural profile
+  plus a suggested animal. Question selection and the profile/animal builder are
+  deterministic and local, so the interview works **key-free**; an ADK
+  `LlmAgent` on **Gemini 3.1 Flash Lite** is wired as the backbone (decision
+  2026-10-08).
 
 ## Setup
 
@@ -44,6 +52,12 @@ Optional Bouncer tuning:
 | `BOUNCER_FACE_MODEL`        | bundled | Path to the YuNet ONNX model (overrides `src/data/`). |
 | `BOUNCER_YUNET_THRESHOLD`   | `0.3`   | Face-detection confidence floor (0-1). |
 
+Optional Interviewer tuning:
+
+| Variable             | Default | What it does |
+| -------------------- | ------- | ------------ |
+| `INTERVIEWER_MODEL`  | `gemini-3.1-flash-lite` | Gemini model for the ADK interview backbone (question selection and the profile/animal builder are local and key-free). |
+
 Never commit `.env` — it is gitignored. Both secrets are scrubbed from every
 log record by a redaction filter (`src/logging_utils.py`); the httpx/httpcore
 loggers are silenced at the client so the token-bearing request URLs never leak.
@@ -58,10 +72,23 @@ Behaviour:
 
 | You send | Bot replies |
 | -------- | --------- |
-| Text | `Hi Mate` |
-| Photo with a human | `Hi Mate` then **`Human detected ✓`** (approved — confirmation flow continues) |
-| Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` then **`Non-human detected`** (rejected + chat state reset) |
+| Text while idle (no interview running) | `Hi Mate` |
+| Photo with a human | `Hi Mate` then **`Human detected ✓`**, then the interview's **Q1** (the interview starts) |
+| Text while interviewing | Exactly **one** next question — the answer is stored in order first |
+| 7th answer | Behavioural profile covering **Habits / Quirks / Routines / Preferences** plus **`Suggested animal: X`** |
+| Text after the interview | Re-sends the stored profile + suggested animal |
+| `/start` or `/restart` | Wipes the chat's Bouncer session **and** Interviewer state, then invites a fresh photo |
+| Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` then **`Non-human detected`** (rejected + Bouncer session and Interviewer state reset) |
 | Photo when Gemini is unreachable | **Local fallback verdict**: face detected → human verdict; no face → non-human verdict. (Only if the local detector fails too does the graceful "Hang on…" reply appear.) |
+
+**The Interviewer state machine.** Interview progress lives on one shared
+per-chat driver (`src/interview_state.py`), keyed by `chat_id`:
+`idle → interviewing → complete`. Answers are stored in order before the next
+question is asked, so an interrupted interview resumes at the right question
+and two chats never see each other's state. Questions and the profile/animal
+builder are a curated, deterministic local bank (`src/interviewer.py`), so the
+interview works **key-free**; an ADK `LlmAgent` on `gemini-3.1-flash-lite` is
+wired as the backbone per the 2026-10-08 decision.
 
 Stop it with `Ctrl-C` (SIGINT) or SIGTERM — it shuts down gracefully.
 
@@ -89,7 +116,9 @@ the key in `.env`.
 download for photos) → `src/bouncer.py` (ADK agent + per-chat in-memory
 sessions, with a hard 60s Gemini timeout) + `src/local_vision.py` (key-free
 YuNet face detector, bundled model in `src/data/`) → `src/gateway.py`
-(polling loop + dispatcher + photo gate).
+(polling loop + dispatcher + photo gate + interview routing) →
+`src/interviewer.py` (ADK backbone + deterministic 7-question bank + animal
+matcher) backed by `src/interview_state.py` (shared per-chat state driver).
 
 The Bouncer's verdict order: **Gemini (ADK agent) first**; on failure or
 timeout it falls back to the local YuNet detector so a photo always gets a

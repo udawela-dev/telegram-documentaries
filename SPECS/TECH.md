@@ -58,7 +58,10 @@ No webhook mode, no database, no cache layer, no extra services.
 - **Versioned per-`chat_id` schema** so old sessions fail predictably rather
   than misbehave after a schema change.
 - **One shared state driver** owns all reads/writes — stages never mutate state
-  directly.
+  directly. The interview stage's driver now exists as `src/interview_state.py`:
+  a versioned `InterviewState` (`schema_version`) keyed by `chat_id` (int) that
+  spans the named phases `idle → interviewing → complete`, with the typed
+  `UserProfile` as the hand-off contract to the next stage.
 - **Reset semantics:** `/start` and `/restart` purge session state *and* any
   temporary media files, then return the flow to the initial phase. The process
   itself keeps running.

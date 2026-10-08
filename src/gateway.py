@@ -1,17 +1,28 @@
-"""Phase 1+2 gateway: long-polling loop + dispatcher (Bouncer gate since Phase 2).
+"""Phase 1+2+3 gateway: long-polling loop + dispatcher (Bouncer gate, Interviewer flow).
 
 Behaviour contract:
-* every TEXT message gets the confirmation reply — no state, no branching;
+* every TEXT message gets the confirmation reply — no state, no branching —
+  when no interviewer is wired (backward compatible default);
+* with an interviewer, text routes on the chat's interview phase: ``idle`` →
+  "Hi Mate" (unchanged), ``interviewing`` → store the answer and send exactly
+  the one next question, ``complete`` → resend the stored profile summary;
 * every PHOTO message passes through The Bouncer gate (Phase 2): approved →
   the confirmation reply is sent unchanged, then a second message announces
-  the verdict ("Human detected ✓"); rejected → cheeky rejection, then a
-  second message ("Non-human detected"), and the chat's ephemeral state is
-  reset; download/classify failures → graceful reply, no reset, loop
-  survives;
+  the verdict ("Human detected ✓"), then the interview starts (Q1); rejected →
+  cheeky rejection, then a second message ("Non-human detected"), and both the
+  chat's Bouncer session and interview state are reset; download/classify
+  failures → graceful reply, no reset, loop survives;
+* ``/start`` and ``/restart`` (with an interviewer wired) reset both stages and
+  send a confirmation reply; without an interviewer every text, commands
+  included, gets the confirmation reply (Phase-1 compatibility);
 * ``offset`` advances after each update is processed OR attempted, so no
   update is ever reprocessed;
 * a failing poll or a failing reply never kills the loop (fail loudly,
   log, keep going — SPECS/TECH.md).
+* The dispatch loop is single-threaded: one update at a time. Interview
+  state transitions (get → mutate → save on the shared driver) are
+  therefore effectively atomic in production (see
+  :mod:`src.interview_state`).
 """
 
 from __future__ import annotations
@@ -25,6 +36,8 @@ from src.bouncer import (
     HUMAN_VERDICT_REPLY,
     NON_HUMAN_VERDICT_REPLY,
 )
+from src.interview_state import InterviewPhase
+from src.interviewer import INTERVIEWER_REPLY_RESET, INTERVIEWER_REPLY_UNAVAILABLE
 from src.telegram_models import Message, TelegramAPIError, Update
 
 logger = logging.getLogger(__name__)
@@ -38,12 +51,15 @@ class Gateway:
         client,
         *,
         bouncer=None,
+        interviewer=None,
         reply_text: str = REPLY_TEXT,
         poll_timeout: int = 30,
         backoff_seconds: float = 0.5,
     ) -> None:
         self._client = client
         self._bouncer = bouncer
+        # When None, text always says "Hi Mate" (Phase-1 backward compatibility).
+        self._interviewer = interviewer
         self._reply_text = reply_text
         self._poll_timeout = poll_timeout
         self._backoff_seconds = backoff_seconds
@@ -107,21 +123,114 @@ class Gateway:
         # with a photo=[] list must hit the gate, never the text branch.
         if update.message.photo is not None:
             return self._handle_photo(update.message, chat_id, update.update_id)
+        return self._handle_text(update.message, chat_id, update.update_id)
+
+    def _handle_text(self, message: Message, chat_id: int, update_id: int) -> bool:
+        """Route a text message by interview phase (Phase 3).
+
+        Without an interviewer this is exactly Phase 1: every text — including
+        ``/start`` / ``/restart`` — gets the confirmation reply. With an
+        interviewer, commands reset both stages, otherwise the reply depends on
+        the chat's interview phase.
+        """
+        if self._interviewer is None:
+            return self._reply_confirmation(chat_id, update_id)
+
+        text = message.text or ""
+        if text.startswith("/start") or text.startswith("/restart"):
+            return self._handle_reset_command(chat_id, update_id)
+
+        try:
+            state = self._interviewer.state(chat_id)
+        except Exception:
+            logger.exception(
+                "event=interview_state_failed chat_id=%s update_id=%d",
+                chat_id,
+                update_id,
+            )
+            return self._reply_confirmation(chat_id, update_id)
+
+        if state.phase is InterviewPhase.INTERVIEWING:
+            return self._handle_interview_answer(chat_id, message.text, update_id)
+        if state.phase is InterviewPhase.COMPLETE:
+            if state.profile is None:
+                # An inconsistent state must never quietly degrade to "Hi Mate"
+                # without a trace (TECH.md: fail loud, no un-logged fallbacks).
+                logger.error(
+                    "event=interview_complete_missing_profile chat_id=%s update_id=%d",
+                    chat_id,
+                    update_id,
+                )
+                return self._reply_confirmation(chat_id, update_id)
+            self._client.send_message(chat_id, state.profile.summary)
+            logger.info(
+                "event=interview_profile_resent chat_id=%s update_id=%d",
+                chat_id,
+                update_id,
+            )
+            return True
+        # IDLE (or any unknown phase): the Phase-1 confirmation reply, unchanged.
+        return self._reply_confirmation(chat_id, update_id)
+
+    def _reply_confirmation(self, chat_id: int, update_id: int) -> bool:
         self._client.send_message(chat_id, self._reply_text)
         logger.info(
             "event=reply_sent update_id=%d chat_id=%s text=%r",
-            update.update_id,
+            update_id,
             chat_id,
             self._reply_text,
         )
         return True
 
-    def _handle_photo(self, message: Message, chat_id: int, update_id: int) -> bool:
-        """Phase 2 gate: photo uploads → The Bouncer.
+    def _handle_interview_answer(self, chat_id: int, text: str | None, update_id: int) -> bool:
+        """Store one answer and deliver exactly the one next question (or profile)."""
+        if text is None:
+            logger.info(
+                "event=interview_answer_missing_text chat_id=%s update_id=%d",
+                chat_id,
+                update_id,
+            )
+            return self._reply_confirmation(chat_id, update_id)
+        try:
+            reply = self._interviewer.answer(chat_id, text)
+        except Exception:
+            logger.exception(
+                "event=interview_answer_failed chat_id=%s update_id=%d",
+                chat_id,
+                update_id,
+            )
+            self._client.send_message(chat_id, INTERVIEWER_REPLY_UNAVAILABLE)
+            return True
+        for outbound in reply.messages:
+            self._client.send_message(chat_id, outbound)
+        return True
 
-        Approved → confirmation flow unchanged. Rejected → cheeky rejection +
-        ephemeral chat state reset. Failure at any step → graceful reply, no
-        reset, loop survives.
+    def _handle_reset_command(self, chat_id: int, update_id: int) -> bool:
+        """``/start`` or ``/restart``: purge Bouncer session + Interviewer state.
+
+        Never fails the loop: each reset is attempted independently and any
+        failure is logged loudly before the confirmation reply is sent.
+        """
+        if self._bouncer is not None:
+            try:
+                self._bouncer.reset_chat(chat_id)
+            except Exception:
+                logger.exception("event=bouncer_session_reset_failed chat_id=%s", chat_id)
+        if self._interviewer is not None:
+            try:
+                self._interviewer.reset(chat_id)
+            except Exception:
+                logger.exception("event=interview_reset_failed chat_id=%s", chat_id)
+        self._client.send_message(chat_id, INTERVIEWER_REPLY_RESET)
+        logger.info("event=reset_command chat_id=%s update_id=%d", chat_id, update_id)
+        return True
+
+    def _handle_photo(self, message: Message, chat_id: int, update_id: int) -> bool:
+        """Photo uploads → The Bouncer; an approved photo starts the interview.
+
+        Approved → confirmation flow unchanged, then Q1. Rejected → cheeky
+        rejection + Bouncer session and interview state reset. Failure at any
+        step → graceful reply, no reset, loop survives.
         """
         if self._bouncer is None:
             logger.error(
@@ -177,6 +286,18 @@ class Gateway:
                 update_id,
                 chat_id,
             )
+            # Approved photo = the interview's entry point: Q1 after the verdict.
+            if self._interviewer is not None:
+                try:
+                    first_question = self._interviewer.start(chat_id)
+                    self._client.send_message(chat_id, first_question)
+                except Exception:
+                    logger.exception(
+                        "event=interview_start_failed chat_id=%s update_id=%d",
+                        chat_id,
+                        update_id,
+                    )
+                    self._client.send_message(chat_id, INTERVIEWER_REPLY_UNAVAILABLE)
             return True
 
         logger.info(
@@ -198,6 +319,12 @@ class Gateway:
             logger.exception(
                 "event=bouncer_session_reset_failed chat_id=%s", chat_id
             )
+        # A rejected photo purges the interview too (mirrors the Bouncer reset).
+        if self._interviewer is not None:
+            try:
+                self._interviewer.reset(chat_id)
+            except Exception:
+                logger.exception("event=interview_reset_failed chat_id=%s", chat_id)
         return True
 
     def run(self, stop_event: threading.Event) -> None:

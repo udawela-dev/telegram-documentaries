@@ -30,6 +30,13 @@ session resets; either way the process stays alive.
 
 ### 3. Interviewer — orchestrator
 
+**Implemented** (`feature/2026-10-08-interviewer`): per-chat interview state
+machine (`src/interview_state.py`, phases `idle → interviewing → complete`) with
+a deterministic, key-free seven-question bank + rule-based animal matcher
+(`src/interviewer.py`); the behavioural dossier accumulates per `chat_id` and
+the finished profile + suggested animal hand off via the typed `UserProfile`
+contract. Offline suite green; live-Telegram verification pending the user.
+
 Sequential, stateful Q&A (5–7 questions, one at a time) accumulating a
 behavioural dossier tied to `chat_id`, ending in a dossier summary plus a
 suggested animal. Owns the state machine and dispatches to later stages.
