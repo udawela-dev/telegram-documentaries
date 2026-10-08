@@ -1,0 +1,21 @@
+# Secrets — never commit (see SPECS/MISSION.md non-negotiables)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Generated media / temp state
+*.ogg
+*.mp3
+*.jpg
+*.jpeg
+*.png
+
+# Tooling / editors
+.codio
+.settings
+.opencode/node_modules/
