@@ -2,9 +2,15 @@
 
 Proves the real ``gemini-3.1-flash-tts-preview`` path — a **direct** Gemini API
 TTS call (no agent, no local fallback) turning the Phase 5 stored script into a
-Telegram-compatible voice note — when a healthy key exists. In this
-repository's environment the Gemini key is blocked (403), so this test stays
-SKIPPED unless ``RUN_LIVE_GEMINI=1`` is set; that skip is expected and correct.
+Telegram-compatible voice note. It only runs when ``RUN_LIVE_GEMINI=1`` *and* a
+healthy key is present in ``.env``; otherwise it stays SKIPPED so offline CI is
+never charged or flaked.
+
+The conversion seam (``src/narrator.py``) stages Gemini TTS's headerless
+LINEAR16 PCM payload (24 kHz mono s16le — ``audio/L16;codec=pcm;rate=24000``)
+as a ``.pcm`` source with the raw input format declared to ffmpeg explicitly,
+then hands back OGG/Opus bytes; the ``OggS`` assertion below locks that output
+contract end-to-end.
 
 The Narrator is built **without** any fallback: a real voice note can only come
 from the real model.

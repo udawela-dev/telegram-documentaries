@@ -13,11 +13,16 @@ file write/read/unlink lifecycle (success AND error), the ffmpeg conversion
 seam (and its loud failure when ffmpeg is missing), the locked copy/constants
 and the token-redaction contract.
 """
+import array
+import io
 import logging
+import math
 import os
+import shutil
 import subprocess
 import tempfile
 import time
+import wave
 
 import pytest
 from google.genai import types as genai_types
@@ -27,8 +32,11 @@ from src.narrator import (
     DEFAULT_NARRATOR_MODEL,
     DEFAULT_NARRATOR_TIMEOUT,
     DEFAULT_NARRATOR_VOICE,
+    NARRATOR_CHANNELS,
+    NARRATOR_PCM_CODEC,
     NARRATOR_PERSONA,
     NARRATOR_REPLY_UNAVAILABLE,
+    NARRATOR_SAMPLE_RATE_HZ,
     Narrator,
     NarratorError,
     resolve_narrator_model,
@@ -41,6 +49,37 @@ SCRIPT = "The sun rises over the savannah, and our subject stirs."
 # Minimal magic-byte samples so format sniffing is exercised for real.
 OGG_BYTES = b"OggS\x00\x02\x00\x00opus-audio-payload"
 WAV_BYTES = b"RIFF\x24\x00\x00\x00WAVEfmt audio-payload"
+# Headerless raw LINEAR16 PCM looks like this in the first bytes — no magic at
+# all, which is exactly why ffmpeg needs the demuxer declared explicitly.
+PCM_HEAD = b"\xe1\x3f\x2c\x40\x00\x00\x11\x40"
+
+# Real-ffmpeg tests stay CI-safe: skipped when the binary is not installed.
+REQUIRES_FFMPEG = pytest.mark.skipif(
+    shutil.which("ffmpeg") is None,
+    reason="ffmpeg not installed — real Ogg/Opus conversion tests skipped",
+)
+
+
+def _sample_pcm_frames(
+    duration_seconds: float = 0.25, sample_rate: int = 24000
+) -> bytes:
+    """Deterministic mono 16-bit LE sine frames (a real headerless PCM payload)."""
+    count = int(duration_seconds * sample_rate)
+    frames = array.array("h")
+    for i in range(count):
+        frames.append(int(4000 * math.sin(2 * math.pi * 440 * i / sample_rate)))
+    return frames.tobytes()
+
+
+def _sample_wav_bytes() -> bytes:
+    """A real, ffmpeg-sniffable WAV file wrapping ``_sample_pcm_frames``."""
+    buffer = io.BytesIO()
+    with wave.open(buffer, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(24000)
+        wav.writeframes(_sample_pcm_frames())
+    return buffer.getvalue()
 
 
 # --- scriptable doubles ---------------------------------------------------------
@@ -197,7 +236,7 @@ def test_synthesize_unlinks_every_temp_file_when_conversion_fails(monkeypatch, c
         def _run_tts(self, script):
             return WAV_BYTES, "audio/wav"
 
-        def _convert_to_ogg(self, input_path, output_path):
+        def _convert_to_ogg(self, input_path, output_path, **kwargs):
             raise NarratorError("ffmpeg is not installed")
 
     narrator = ExplodingConvert()
@@ -262,6 +301,215 @@ def test_synthesize_converts_non_ogg_audio_end_to_end_to_a_real_ogg_temp_path(
     # A real ``.ogg`` target temp path was created and every temp path unlinked.
     assert any(path.endswith(".ogg") for path in created)
     assert all(not os.path.exists(path) for path in created)
+
+
+# --- real-ffmpeg input contract (CI-safe: skipped when ffmpeg is absent) --------
+#
+# The live B2 bug: the model's default payload is *headerless* LINEAR16 PCM, and
+# the seam staged it as an opaque ``.tmp`` with no declared demuxer, so ffmpeg
+# aborted with "Invalid data found when processing input". These tests exercise
+# the real binary and lock the new input contract.
+
+
+@REQUIRES_FFMPEG
+def test_real_ffmpeg_converts_a_wav_header_payload_to_oggs():
+    """A RIFF/WAVE payload is staged with a ``.wav`` suffix and ffmpeg sniffs it."""
+    narrator = ScriptedNarrator(audio=_sample_wav_bytes(), mime="audio/wav")
+
+    audio = narrator.synthesize(20, SCRIPT)
+
+    assert audio[:4] == b"OggS"
+    assert len(audio) > 100
+
+
+@REQUIRES_FFMPEG
+def test_real_ffmpeg_converts_headerless_pcm_payload_to_oggs():
+    """The live bug case: headerless LINEAR16 PCM must convert to real Ogg/Opus.
+
+    A ``.tmp`` stage with no declared demuxer fails here ("Invalid data found");
+    the seam must declare Gemini TTS's known raw format (s16le/24000/mono).
+    """
+    narrator = ScriptedNarrator(
+        audio=_sample_pcm_frames(), mime="audio/L16; rate=24000"
+    )
+
+    audio = narrator.synthesize(21, SCRIPT)
+
+    assert audio[:4] == b"OggS"
+    assert len(audio) > 100
+
+
+@REQUIRES_FFMPEG
+def test_real_ffmpeg_probing_an_opaque_tmp_headerless_pcm_source_fails(tmp_path):
+    """Negative control for the B2 bug: the *same* headerless LINEAR16 payload
+    staged as an opaque ``.tmp`` with no declared input format is exactly the
+    live failure.
+
+    Real ffmpeg cannot probe a headerless payload — it exits 1 with "Invalid
+    data found when processing input". This pins the class of bug the seam
+    prevents: the declared ``-f s16le -ar 24000 -ac 1`` input args (proven green
+    by ``test_real_ffmpeg_converts_headerless_pcm_payload_to_oggs``) are
+    load-bearing, not cosmetic — reverting the seam re-introduces this error.
+    """
+    source = tmp_path / "narrator-source-opaque.tmp"
+    source.write_bytes(_sample_pcm_frames())
+    target = tmp_path / "out.ogg"
+    narrator = Narrator()
+
+    with pytest.raises(NarratorError) as excinfo:
+        narrator._convert_to_ogg(str(source), str(target))
+
+    assert "Invalid data found" in str(excinfo.value)
+
+
+def test_headerless_pcm_is_declared_as_s16le_24000_mono_and_staged_as_pcm(monkeypatch):
+    """Prevention lock: the raw-PCM contract is declared to ffmpeg explicitly and
+    the source temp file gets a ``.pcm`` suffix (not an opaque ``.tmp``)."""
+    monkeypatch.setattr(narrator_module.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    created = _spy_tempfiles(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        # Read the staged source before ``synthesize``'s ``finally`` unlinks it.
+        with open(cmd[cmd.index("-i") + 1], "rb") as handle:
+            captured["input_bytes"] = handle.read()
+        with open(cmd[-1], "wb") as handle:
+            handle.write(OGG_BYTES)
+
+        class Completed:
+            returncode = 0
+            stderr = b""
+
+        return Completed()
+
+    monkeypatch.setattr(narrator_module.subprocess, "run", fake_run)
+    pcm = _sample_pcm_frames()
+    narrator = ScriptedNarrator(audio=pcm, mime="audio/L16; rate=24000")
+
+    audio = narrator.synthesize(22, SCRIPT)
+
+    assert audio == OGG_BYTES
+    cmd = captured["cmd"]
+    # The declared input format comes *before* ``-i``; the output ``-f ogg`` last.
+    assert cmd[cmd.index("-f") + 1] == NARRATOR_PCM_CODEC
+    assert cmd[cmd.index("-ar") + 1] == str(NARRATOR_SAMPLE_RATE_HZ)
+    assert cmd[cmd.index("-ac") + 1] == str(NARRATOR_CHANNELS)
+    assert cmd[cmd.index("-i") + 1].endswith(".pcm")
+    assert captured["input_bytes"] == pcm
+    assert any(path.endswith(".pcm") for path in created)
+    assert cmd[-3:] == ["-f", "ogg", cmd[-1]]
+
+
+def test_wav_payload_is_staged_as_dot_wav_without_a_declared_input_format(monkeypatch):
+    """A self-describing RIFF/WAVE payload needs no ``-f`` hint (ffmpeg probes)."""
+    monkeypatch.setattr(narrator_module.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    created = _spy_tempfiles(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        # Read the staged source before ``synthesize``'s ``finally`` unlinks it.
+        with open(cmd[cmd.index("-i") + 1], "rb") as handle:
+            captured["input_bytes"] = handle.read()
+        with open(cmd[-1], "wb") as handle:
+            handle.write(OGG_BYTES)
+
+        class Completed:
+            returncode = 0
+            stderr = b""
+
+        return Completed()
+
+    monkeypatch.setattr(narrator_module.subprocess, "run", fake_run)
+    wav = _sample_wav_bytes()
+    narrator = ScriptedNarrator(audio=wav, mime="audio/wav")
+
+    audio = narrator.synthesize(23, SCRIPT)
+
+    assert audio == OGG_BYTES
+    cmd = captured["cmd"]
+    # No demuxer arg between ``-loglevel error`` and ``-i`` for a sniffable WAV.
+    i = cmd.index("-i")
+    assert cmd[i - 1] == "error"
+    assert cmd[i + 1].endswith(".wav")
+    assert captured["input_bytes"] == wav
+    assert any(path.endswith(".wav") for path in created)
+
+
+def test_non_pcm_mime_is_probed_by_ffmpeg_without_a_declared_input_format(
+    monkeypatch,
+):
+    """N1: an MP3/FLAC (or otherwise non-PCM) payload must not be force-decoded.
+
+    The old seam treated *everything* non-RIFF as headerless s16le/24000/mono. A
+    future non-PCM response would then be decoded as raw PCM → silent noise
+    (a fail-open honesty bug). The seam must instead stage the source opaquely
+    (``.tmp``) with no declared format so ffmpeg probes the real container.
+    """
+    monkeypatch.setattr(narrator_module.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    created = _spy_tempfiles(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        with open(cmd[-1], "wb") as handle:
+            handle.write(OGG_BYTES)
+
+        class Completed:
+            returncode = 0
+            stderr = b""
+
+        return Completed()
+
+    monkeypatch.setattr(narrator_module.subprocess, "run", fake_run)
+    # A real MP3 begins with an ID3 tag / frame sync, never RIFF/L16.
+    mp3 = b"ID3\x04\x00\x00\x00\x00\x00\x00mp3-audio-payload"
+    narrator = ScriptedNarrator(audio=mp3, mime="audio/mpeg")
+
+    audio = narrator.synthesize(24, SCRIPT)
+
+    assert audio == OGG_BYTES
+    cmd = captured["cmd"]
+    i = cmd.index("-i")
+    # No demuxer args between ``-loglevel error`` and ``-i``: ffmpeg probes.
+    assert cmd[i - 1] == "error"
+    assert cmd[i + 1].endswith(".tmp")
+    assert any(path.endswith(".tmp") for path in created)
+
+
+def test_linear_pcm_mime_rate_is_honoured_in_the_declared_input_format(monkeypatch):
+    """N1: when the mime declares linear PCM, its ``rate=`` pins ``-ar`` (not the
+    24000 default), so a differently-sampled payload is not played back at the
+    wrong speed."""
+    monkeypatch.setattr(narrator_module.shutil, "which", lambda name: "/usr/bin/ffmpeg")
+    _spy_tempfiles(monkeypatch)
+    captured: dict[str, object] = {}
+
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        with open(cmd[-1], "wb") as handle:
+            handle.write(OGG_BYTES)
+
+        class Completed:
+            returncode = 0
+            stderr = b""
+
+        return Completed()
+
+    monkeypatch.setattr(narrator_module.subprocess, "run", fake_run)
+    narrator = ScriptedNarrator(
+        audio=_sample_pcm_frames(sample_rate=16000),
+        mime="audio/L16;codec=pcm;rate=16000",
+    )
+
+    audio = narrator.synthesize(25, SCRIPT)
+
+    assert audio == OGG_BYTES
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("-f") + 1] == NARRATOR_PCM_CODEC
+    assert cmd[cmd.index("-ar") + 1] == "16000"
+    assert cmd[cmd.index("-i") + 1].endswith(".pcm")
 
 
 def test_ogg_audio_is_not_converted(monkeypatch):

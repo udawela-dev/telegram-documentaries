@@ -16,7 +16,9 @@ from src.bouncer import (
     BOUNCER_REJECTION,
     BOUNCER_UNAVAILABLE_REPLY,
     HUMAN_VERDICT_REPLY,
+    HUMAN_VERDICT_REPLY_LOCAL,
     NON_HUMAN_VERDICT_REPLY,
+    NON_HUMAN_VERDICT_REPLY_LOCAL,
     Bouncer,
     parse_decision,
 )
@@ -123,6 +125,72 @@ def test_parse_decision_rejects_uncertain_prose_safely():
     assert decision.human_present is False
 
 
+# --- source tagging: every parsed Gemini verdict is source="gemini" -------------
+# (offline-face-check labelling — 2026-10-09 — the chat must only claim
+# "(offline face check)" when the verdict actually came from the local fallback)
+
+
+def test_parse_decision_tags_accepted_gemini_verdict_as_gemini():
+    decision = parse_decision('{"human_present": true, "reason": "A clear face is visible."}')
+
+    assert decision.source == "gemini"
+
+
+def test_parse_decision_tags_rejected_gemini_verdict_as_gemini():
+    decision = parse_decision('{"human_present": false, "reason": "Empty beach, no people."}')
+
+    assert decision.source == "gemini"
+
+
+def test_parse_decision_tags_markdown_fenced_gemini_verdict_as_gemini():
+    decision = parse_decision('```json\n{"human_present": true, "reason": "Yes"}\n```')
+
+    assert decision.source == "gemini"
+
+
+def test_parse_decision_reject_safe_failures_stay_tagged_gemini():
+    """Reject-safe parse failures are still Gemini decisions, not local ones."""
+    for raw in (
+        "",
+        "Sorry, I don't see anyone here.",
+        "[1, 2, 3]",
+        '{"reason": "no verdict field present"}',
+        '{"human_present": "maybe", "reason": "x"}',
+    ):
+        assert parse_decision(raw).source == "gemini"
+
+
+def test_parse_decision_ignores_a_model_supplied_local_source():
+    """B1: provenance is code-assigned — the model cannot claim an offline verdict.
+
+    ``source`` is a declared field, so ``extra="ignore"`` alone would let a Gemini
+    reply carrying ``"source": "local"`` masquerade as an offline face check and
+    trigger the wrong chat copy. Only ``_local_verdict`` may set ``"local"``.
+    """
+    decision = parse_decision(
+        '{"human_present": true, "reason": "x", "source": "local"}'
+    )
+
+    assert decision.human_present is True
+    assert decision.source == "gemini"
+
+
+def test_parse_decision_ignores_a_model_supplied_bogus_source():
+    """A model-supplied ``source`` outside the literal set must not fail or leak."""
+    decision = parse_decision(
+        '{"human_present": true, "reason": "x", "source": "bogus"}'
+    )
+
+    assert decision.human_present is True
+    assert decision.source == "gemini"
+
+
+def test_parse_decision_defaults_source_to_gemini_when_key_is_absent():
+    decision = parse_decision('{"human_present": true, "reason": "x"}')
+
+    assert decision.source == "gemini"
+
+
 # --- Bouncer: verdict routing with a scripted LLM step --------------------------
 
 
@@ -146,6 +214,7 @@ def test_classify_scripted_approval_returns_true_decision():
 
     assert decision.human_present is True
     assert decision.reason == "face"
+    assert decision.source == "gemini"
     assert bouncer.llm_calls == [(len(b"\x89PNG-bytes"), "501")]
 
 
@@ -238,6 +307,12 @@ def test_verdict_reply_copies_are_locked():
     assert NON_HUMAN_VERDICT_REPLY == "Non-human detected"
 
 
+def test_offline_verdict_reply_copies_are_locked():
+    """The local fallback announces itself honestly: it is a face check, offline."""
+    assert HUMAN_VERDICT_REPLY_LOCAL == "Human detected ✓ (offline face check)"
+    assert NON_HUMAN_VERDICT_REPLY_LOCAL == "Non-human detected (offline face check)"
+
+
 def test_default_model_is_gemini_flash_lite():
     assert BOUNCER_MODEL == "gemini-3.1-flash-lite"
 
@@ -285,7 +360,7 @@ class SpyBouncer(Bouncer):
 def local_classifier() -> LocalVisionClassifier:
     detector = LocalVisionClassifier()
     if not detector.available:
-        pytest.skip("Haar cascades unavailable (opencv data missing)")
+        pytest.skip("YuNet model unavailable (opencv data missing)")
     return detector
 
 
@@ -310,6 +385,19 @@ def test_gemini_failure_falls_back_to_local_non_human_verdict(local_classifier, 
 
     assert decision.human_present is False
     assert "non-human" in decision.reason
+    assert decision.source == "local"
+
+
+def test_local_fallback_approval_is_tagged_local(local_classifier, monkeypatch):
+    """A local face-check approval must be marked source="local" so the chat can
+    label it honestly (an animal can pass the weak offline face gate)."""
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+    bouncer = RaisingBouncer(api_key="x", local_classifier=local_classifier)
+
+    decision = bouncer.classify(PERSON_JPEG, chat_id=905)
+
+    assert decision.human_present is True
+    assert decision.source == "local"
 
 
 def test_local_only_mode_skips_gemini_entirely(local_classifier, monkeypatch):
@@ -321,6 +409,7 @@ def test_local_only_mode_skips_gemini_entirely(local_classifier, monkeypatch):
 
     assert decision.human_present is True
     assert bouncer.llm_calls == 0  # keyless round-trip avoided
+    assert decision.source == "local"
 
 
 def test_gemini_timeout_falls_back_to_local(local_classifier, monkeypatch):
@@ -341,4 +430,5 @@ def test_gemini_timeout_falls_back_to_local(local_classifier, monkeypatch):
     elapsed = time.monotonic() - started
     assert decision.human_present is True
     assert "local" in decision.reason
+    assert decision.source == "local"
     assert elapsed < 4  # bounded by the 0.3s timeout, not the 5s sleep

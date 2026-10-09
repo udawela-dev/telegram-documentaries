@@ -9,12 +9,17 @@ import logging
 
 from src.bouncer import (
     BOUNCER_REJECTION,
-    BOUNCER_UNAVAILABLE_REPLY,
-    BouncerDecision,
     HUMAN_VERDICT_REPLY,
     NON_HUMAN_VERDICT_REPLY,
+    BouncerDecision,
 )
-from src.gateway import Gateway, REPLY_TEXT
+from src.gateway import (
+    GATEWAY_REPLY_NEED_PHOTO,
+    GATEWAY_REPLY_PHOTO_DURING_INTERVIEW,
+    GATEWAY_REPLY_RETRY_HINT,
+    REPLY_TEXT,
+    Gateway,
+)
 from src.interview_state import (
     InterviewPhase,
     InterviewState,
@@ -27,7 +32,14 @@ from src.interviewer import (
     INTERVIEWER_REPLY_UNAVAILABLE,
     Interviewer,
 )
-from src.telegram_models import Chat, Message, PhotoSize, TelegramAPIError, TelegramFile, Update
+from src.telegram_models import (
+    Chat,
+    Message,
+    PhotoSize,
+    TelegramAPIError,
+    TelegramFile,
+    Update,
+)
 
 
 class GateClient:
@@ -103,7 +115,9 @@ def _gateway(client, bouncer, interviewer) -> Gateway:
 # --- IDLE regression -----------------------------------------------------------
 
 
-def test_idle_text_still_gets_hi_mate():
+def test_idle_text_prompts_for_a_photo():
+    """Phase 7: at IDLE the loop tells the user to send a portrait; 'Hi Mate'
+    alone would leave them guessing. (COMPLETE chats keep the confirmation.)"""
     client = GateClient()
     bouncer = FakeBouncer(verdicts=[])
     interviewer = _interviewer()
@@ -112,7 +126,7 @@ def test_idle_text_still_gets_hi_mate():
     replied = _gateway(client, bouncer, interviewer).poll_once()
 
     assert replied == 1
-    assert client.sent == [(111, REPLY_TEXT)]
+    assert client.sent == [(111, GATEWAY_REPLY_NEED_PHOTO)]
     assert interviewer.state(111).phase is InterviewPhase.IDLE
 
 
@@ -280,10 +294,10 @@ def test_restart_mid_interview_resets_both_stages_and_confirms():
     assert interviewer.state(701).phase is InterviewPhase.IDLE
     assert client.sent[-1] == (701, INTERVIEWER_REPLY_RESET)
 
-    # After restart, plain text is back to the idle "Hi Mate" flow.
+    # After restart, plain text prompts for a portrait again (Phase 7).
     client.queue([_text_update(42, chat_id=701, text="hello again")])
     gateway.poll_once()
-    assert client.sent[-1] == (701, REPLY_TEXT)
+    assert client.sent[-1] == (701, GATEWAY_REPLY_NEED_PHOTO)
 
 
 def test_start_command_also_resets():
@@ -372,6 +386,8 @@ def test_interview_state_lookup_failure_replies_confirmation_and_recovers(caplog
 
 
 def test_rejected_photo_keeps_rejection_flow_and_purges_interview_state():
+    """Phase 7 decision: photos during an interview are refused, never re-gated.
+    So a rejection is only reachable from IDLE — it must still purge state."""
     client = GateClient()
     bouncer = FakeBouncer(verdicts=[True, False])
     interviewer = _interviewer()
@@ -382,31 +398,41 @@ def test_rejected_photo_keeps_rejection_flow_and_purges_interview_state():
     gateway.poll_once()
     assert interviewer.state(901).phase is InterviewPhase.INTERVIEWING
 
-    client.queue([_photo_update(10, chat_id=901)])
+    # Back to IDLE, then a non-human photo gets the full rejection flow.
+    client.queue([_text_update(71, chat_id=901, text="/restart")])
+    gateway.poll_once()
+    assert interviewer.state(901).phase is InterviewPhase.IDLE
+
+    client.queue([_photo_update(72, chat_id=901)])
     gateway.poll_once()
 
     assert client.sent[-2:] == [(901, BOUNCER_REJECTION), (901, NON_HUMAN_VERDICT_REPLY)]
-    assert bouncer.resets == [901]
+    assert bouncer.resets == [901, 901]  # /restart + rejection both reset
     assert interviewer.state(901).phase is InterviewPhase.IDLE
 
-    # Next text is the idle "Hi Mate", not a question continuation.
-    client.queue([_text_update(71, chat_id=901, text="anything")])
+    # Next text is the portrait prompt, not a question continuation (Phase 7).
+    client.queue([_text_update(73, chat_id=901, text="anything")])
     gateway.poll_once()
-    assert client.sent[-1] == (901, REPLY_TEXT)
+    assert client.sent[-1] == (901, GATEWAY_REPLY_NEED_PHOTO)
 
 
 def test_rejection_resets_only_the_rejected_chats_interviewer_state():
+    """A rejection only happens from IDLE, and only touches that one chat."""
     client = GateClient()
     bouncer = FakeBouncer(verdicts=[True, True, False])
     interviewer = _interviewer()
     gateway = _gateway(client, bouncer, interviewer)
     client.queue([_photo_update(11, chat_id=1101), _photo_update(12, chat_id=1102)])
     gateway.poll_once()
-    client.queue([_photo_update(13, chat_id=1101)])  # rejected
+    # Chat 1101 returns to IDLE, then sends a non-human photo → rejected.
+    client.queue([_text_update(13, chat_id=1101, text="/restart")])
+    gateway.poll_once()
+    client.queue([_photo_update(14, chat_id=1101)])  # rejected
     gateway.poll_once()
 
     assert interviewer.state(1101).phase is InterviewPhase.IDLE
     assert interviewer.state(1102).phase is InterviewPhase.INTERVIEWING
+    assert 1102 not in bouncer.resets  # the other chat's session is untouched
 
 
 # --- backward compatibility ----------------------------------------------------
@@ -475,13 +501,14 @@ def test_start_failure_is_logged_and_loop_survives(caplog):
         (1401, REPLY_TEXT),
         (1401, HUMAN_VERDICT_REPLY),
         (1401, INTERVIEWER_REPLY_UNAVAILABLE),
+        (1401, GATEWAY_REPLY_RETRY_HINT),
     ]
     assert any("event=interview_start_failed" in r.message for r in caplog.records)
 
-    # The loop still processes later batches.
+    # The loop still processes later batches (IDLE → portrait prompt, Phase 7).
     client.queue([_text_update(92, chat_id=1401, text="still here")])
     gateway.poll_once()
-    assert client.sent[-1] == (1401, REPLY_TEXT)
+    assert client.sent[-1] == (1401, GATEWAY_REPLY_NEED_PHOTO)
 
 
 def test_answer_failure_is_logged_and_loop_survives(caplog):
@@ -498,7 +525,10 @@ def test_answer_failure_is_logged_and_loop_survives(caplog):
         replied = gateway.poll_once()
 
     assert replied == 1
-    assert client.sent[-1] == (1501, INTERVIEWER_REPLY_UNAVAILABLE)
+    assert client.sent[-2:] == [
+        (1501, INTERVIEWER_REPLY_UNAVAILABLE),
+        (1501, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert any("event=interview_answer_failed" in r.message for r in caplog.records)
 
     # State is intact: the next good answer continues the sequence.
@@ -508,24 +538,34 @@ def test_answer_failure_is_logged_and_loop_survives(caplog):
     assert client.sent[-1] == (1501, INTERVIEW_QUESTIONS[1])
 
 
-def test_photo_gate_failure_does_not_disturb_an_in_progress_interview(caplog):
+def test_photo_during_interview_is_refused_without_disturbing_the_interview():
+    """Phase 7: a photo mid-interview is refused before the gate (and before any
+    download) is even attempted — the in-progress interview is left untouched."""
     client = GateClient()
-    bouncer = FakeBouncer(verdicts=[True])
+    bouncer = FakeBouncer(verdicts=[True, True])  # the second photo never reaches the gate
     interviewer = _interviewer()
     gateway = _gateway(client, bouncer, interviewer)
     client.queue([_photo_update(96, chat_id=1601)])
     gateway.poll_once()
     client.queue([_text_update(97, chat_id=1601, text="answer one")])
     gateway.poll_once()
-
-    client._fail_download = True
-    client.queue([_photo_update(98, chat_id=1601)])  # download fails
-    with caplog.at_level(logging.ERROR):
-        gateway.poll_once()
-
-    assert client.sent[-1] == (1601, BOUNCER_UNAVAILABLE_REPLY)
     assert interviewer.state(1601).phase is InterviewPhase.INTERVIEWING
-    assert bouncer.resets == []  # a failed gate never resets state
+    classify_calls_before = len(bouncer.classify_calls)
+
+    client.queue([_photo_update(98, chat_id=1601)])  # a second photo mid-interview
+    gateway.poll_once()
+
+    assert client.sent[-1] == (1601, GATEWAY_REPLY_PHOTO_DURING_INTERVIEW)
+    assert len(bouncer.classify_calls) == classify_calls_before  # gate not re-run
+    assert bouncer.resets == []  # no reset, no purge
+    assert interviewer.state(1601).phase is InterviewPhase.INTERVIEWING
+    assert len(interviewer.state(1601).answers) == 1  # interview undisturbed
+
+    # The interview carries on: the next answer advances normally.
+    client.queue([_text_update(99, chat_id=1601, text="answer two")])
+    gateway.poll_once()
+    assert client.sent[-1] == (1601, INTERVIEW_QUESTIONS[2])
+    assert len(interviewer.state(1601).answers) == 2
 
 
 # --- event logging -------------------------------------------------------------

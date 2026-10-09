@@ -39,12 +39,24 @@ No webhook mode, no database, no cache layer, no extra services.
   unpreventable `finally`-cleanup on success and error; a non-voice-note
   format is converted to OGG/Opus via an ffmpeg seam (`-f ogg` forced before
   the output path; missing ffmpeg when conversion is needed → loud
-  `NarratorError`). **Deliberately no local/fake TTS fallback**: any failure
+  `NarratorError`). The seam's input format is decided from the response
+  **mime**, not the bytes (2026-10-09, live-verified): the TTS model returns
+  headerless LINEAR16 PCM (`audio/L16;codec=pcm;rate=24000`, mono s16le), so a
+  declared LINEAR16 mime stages `.pcm` + explicit `-f s16le -ar <rate> -ac 1`;
+  RIFF/WAVE stages `.wav` and is probed; anything else stages an opaque `.tmp`
+  probed by content so an unknown format fails loudly instead of being
+  force-decoded as PCM. **Deliberately no local/fake TTS fallback**: any failure
   degrades to the locked `NARRATOR_REPLY_UNAVAILABLE` — audio quality is never
   faked. Delivery via `send_voice`; a send failure logs
   `event=narrator_send_failed` loudly with no unavailable reply (the note may
   have been delivered). The Narrator adds no state fields — audio is
   transient, temp media purged.
+- **The Bouncer's local fallback verdicts are labelled.** The vision gate's
+  primary judge is the ADK `LlmAgent` on Gemini (Phase 2, `src/bouncer.py`);
+  when Gemini is unreachable/missing a key the key-free **YuNet** face detector
+  (`src/local_vision.py`) supplies the verdict and `BouncerDecision.source`
+  becomes `"local"`. Local (YuNet) verdicts are labeled "(offline face check)"
+  in the chat; Gemini verdicts keep the standard copy.
 - **The Converter returns the image directly to Telegram** with no intermediate
   text hop: on completion the gateway sends the stored profile text, then makes
   **one multimodal ADK call** (`src/converter.py`) — the raw portrait
@@ -120,9 +132,35 @@ No webhook mode, no database, no cache layer, no extra services.
   raw TTS-ready paragraph for the Phase 6 Narrator); a v1 record is migrated
   losslessly to v2 (`script=None`, logged `event=state_migrated`) and a record
   newer than the current version fails loud.
-- **Reset semantics:** `/start` and `/restart` purge session state *and* any
-  temporary media files, then return the flow to the initial phase. The process
-  itself keeps running.
+- **Reset semantics (Phase 7):** `/start` and `/restart` are **identical** —
+  an instant per-chat reset from **any** phase (idle/interviewing/complete),
+  with **no confirmation prompt**. The sweep purges the Bouncer, Interviewer,
+  Converter **and Scripter** sessions, the stored portrait, and **all temp
+  assets registered for that chat** (`src/temp_assets.py` — the Narrator
+  tracks every staged audio file at creation) for the same `chat_id`; each
+  per-stage failure is logged loud and never fatal to the loop, and the
+  process keeps running. **Stale-task invalidation is by construction, not by
+  token:** dispatch is strictly sequential (single-threaded `poll_once`; every
+  stage call blocks up to its timeout), so a reset can never interleave
+  mid-generation — it is honoured at the next free step, and an in-flight
+  step's deliveries complete before the purge applies. Stage timeout workers
+  are daemon threads that can neither send to Telegram nor write shared state
+  (`test_reset_queued_behind_a_stage_update_is_honoured_at_the_next_free_step`
+  locks the guarantee; the originally planned epoch guard is unreachable code
+  in this architecture and was retired by user decision). A reset session may
+  begin again immediately (the next photo re-enters at `IDLE`).
+- **Wrong payload at the wrong stage (Phase 7):** the interview phase is
+  checked **before** the gate — a photo sent while `INTERVIEWING` or
+  `COMPLETE` is refused with the locked `GATEWAY_REPLY_PHOTO_DURING_INTERVIEW`
+  and never reaches the Bouncer, portrait store, or interview state (the gate
+  runs **only** from `IDLE`). Text at `IDLE` now prompts for a portrait
+  (`GATEWAY_REPLY_NEED_PHOTO`, logged `event=idle_text_photo_prompt`) instead
+  of the bare "Hi Mate" confirmation; non-photo media (video/document/sticker)
+  is routed by phase through `_handle_media` (`event=media_no_photo`) with the
+  same copy; duplicate `update_id`s in one batch are applied once
+  (`event=skip_duplicate_update`). Every degraded stage reply (Bouncer /
+  Converter / Scripter / Narrator unavailable, photo download failure) is
+  followed by one locked retry hint `GATEWAY_REPLY_RETRY_HINT`.
 - Strict isolation: a `chat_id` can only ever read its own state.
 
 ## Testing

@@ -63,7 +63,9 @@ from src.bouncer import (
     BOUNCER_REJECTION,
     BOUNCER_UNAVAILABLE_REPLY,
     HUMAN_VERDICT_REPLY,
+    HUMAN_VERDICT_REPLY_LOCAL,
     NON_HUMAN_VERDICT_REPLY,
+    NON_HUMAN_VERDICT_REPLY_LOCAL,
 )
 from src.converter import CONVERTER_REPLY_UNAVAILABLE
 from src.interview_state import InterviewPhase
@@ -71,10 +73,15 @@ from src.interviewer import INTERVIEWER_REPLY_RESET, INTERVIEWER_REPLY_UNAVAILAB
 from src.narrator import NARRATOR_REPLY_UNAVAILABLE
 from src.scripter import SCRIPTER_REPLY_UNAVAILABLE
 from src.telegram_models import Message, TelegramAPIError, Update
+from src.temp_assets import TempAssets
 
 logger = logging.getLogger(__name__)
 
 REPLY_TEXT = "Hi Mate"
+
+GATEWAY_REPLY_PHOTO_DURING_INTERVIEW = "please answer the current question with text, or type /restart"
+GATEWAY_REPLY_NEED_PHOTO = "upload a clear portrait photo"
+GATEWAY_REPLY_RETRY_HINT = "try again, or type /restart"
 
 
 class Gateway:
@@ -88,6 +95,7 @@ class Gateway:
         portraits=None,
         scripter=None,
         narrator=None,
+        temp_assets=None,
         reply_text: str = REPLY_TEXT,
         poll_timeout: int = 30,
         backoff_seconds: float = 0.5,
@@ -106,10 +114,19 @@ class Gateway:
         # Phase 6: the narrator. When None, completion is exactly Phases 1-5
         # (no voice note).
         self._narrator = narrator
+        self._temp_assets = temp_assets or TempAssets()
         self._reply_text = reply_text
         self._poll_timeout = poll_timeout
         self._backoff_seconds = backoff_seconds
         self.offset: int = 0  # next offset = highest processed update_id + 1
+
+        # Reset timing guarantee (Phase 7, verified by review): dispatch is
+        # STRICTLY sequential — every AI stage blocks poll_once up to its
+        # timeout, so a /start or /restart is always honoured at the next free
+        # step, never mid-generation, and no superseded run can interleave. The
+        # stage timeout workers are daemon threads that can neither send to
+        # Telegram nor write shared state, so nothing needs invalidation beyond
+        # the reset sweep itself (state purge + portrait delete + temp purge).
 
     def poll_once(self) -> int:
         """Poll, dispatch, advance the offset. Returns how many replies were sent.
@@ -130,7 +147,22 @@ class Gateway:
             return 0
 
         replied = 0
+        # Duplicate guard for THIS batch: Telegram advances offsets so it never
+        # redelivers across batches, but one getUpdates response may still
+        # contain repeats. The seen set is scoped to the batch (bounded), and a
+        # replayed update_id must not advance the state machine twice.
+        batch_seen: set[int] = set()
         for update in updates:
+            update_id = getattr(update, "update_id", None)
+            if update_id is not None and update_id in batch_seen:
+                logger.info(
+                    "event=skip_duplicate_update update_id=%d", update_id
+                )
+                self.offset = max(self.offset, update_id)
+                continue
+            if update_id is not None:
+                batch_seen.add(update_id)
+
             try:
                 if self._dispatch(update):
                     replied += 1
@@ -156,6 +188,58 @@ class Gateway:
         self.offset += 1 if updates else 0
         return replied
 
+    def _handle_media(self, message: Message, chat_id: int, update_id: int) -> bool:
+        """Non-photo, non-text uploads (video/audio/document/sticker/…).
+
+        Phase 7: such payloads carry no text and cannot move the state machine,
+        so they are logged distinctly and routed with the same copy the phase
+        would give a wrong text — never silently swallowed, never fatal.
+        """
+        media_type = next(
+            (
+                field
+                for field in (
+                    "video",
+                    "audio",
+                    "document",
+                    "sticker",
+                    "animation",
+                    "voice",
+                    "video_note",
+                )
+                if getattr(message, field, None) is not None
+            ),
+            "other",
+        )
+        logger.info(
+            "event=media_no_photo chat_id=%s update_id=%d media_type=%s",
+            chat_id,
+            update_id,
+            media_type,
+        )
+        if self._interviewer is None:
+            return self._reply_confirmation(chat_id, update_id)
+        try:
+            state = self._interviewer.state(chat_id)
+        except Exception:
+            logger.exception(
+                "event=interview_state_failed chat_id=%s update_id=%d",
+                chat_id,
+                update_id,
+            )
+            return self._reply_confirmation(chat_id, update_id)
+        if state.phase is InterviewPhase.INTERVIEWING:
+            # No answer text arrived: ask for the answer (or a reset), exactly
+            # as a wrong photo would during the interview.
+            self._client.send_message(chat_id, GATEWAY_REPLY_PHOTO_DURING_INTERVIEW)
+            return True
+        if state.phase is InterviewPhase.COMPLETE:
+            # Same reply as text would give at COMPLETE: re-send the profile.
+            return self._reply_complete_phase(chat_id, update_id, state)
+        # IDLE / unknown: the text equivalent is the portrait prompt.
+        self._client.send_message(chat_id, GATEWAY_REPLY_NEED_PHOTO)
+        return True
+
     def _dispatch(self, update: Update) -> bool:
         """Reply to one update. Returns True when a reply was sent."""
         if update.message is None:
@@ -169,7 +253,9 @@ class Gateway:
         # with a photo=[] list must hit the gate, never the text branch.
         if update.message.photo is not None:
             return self._handle_photo(update.message, chat_id, update.update_id)
-        return self._handle_text(update.message, chat_id, update.update_id)
+        if update.message.text is not None:
+            return self._handle_text(update.message, chat_id, update.update_id)
+        return self._handle_media(update.message, chat_id, update.update_id)
 
     def _handle_text(self, message: Message, chat_id: int, update_id: int) -> bool:
         """Route a text message by interview phase (Phase 3).
@@ -183,7 +269,7 @@ class Gateway:
             return self._reply_confirmation(chat_id, update_id)
 
         text = message.text or ""
-        if text.startswith("/start") or text.startswith("/restart"):
+        if text.startswith(("/start", "/restart")):
             return self._handle_reset_command(chat_id, update_id)
 
         try:
@@ -199,24 +285,30 @@ class Gateway:
         if state.phase is InterviewPhase.INTERVIEWING:
             return self._handle_interview_answer(chat_id, message.text, update_id)
         if state.phase is InterviewPhase.COMPLETE:
-            if state.profile is None:
-                # An inconsistent state must never quietly degrade to "Hi Mate"
-                # without a trace (TECH.md: fail loud, no un-logged fallbacks).
-                logger.error(
-                    "event=interview_complete_missing_profile chat_id=%s update_id=%d",
-                    chat_id,
-                    update_id,
-                )
-                return self._reply_confirmation(chat_id, update_id)
-            self._client.send_message(chat_id, state.profile.summary)
-            logger.info(
-                "event=interview_profile_resent chat_id=%s update_id=%d",
+            return self._reply_complete_phase(chat_id, update_id, state)
+        # IDLE (or any unknown phase): prompt for the portrait, not "Hi Mate".
+        logger.info("event=idle_text_photo_prompt chat_id=%s update_id=%d", chat_id, update_id)
+        self._client.send_message(chat_id, GATEWAY_REPLY_NEED_PHOTO)
+        return True
+
+    def _reply_complete_phase(self, chat_id: int, update_id: int, state) -> bool:
+        """The COMPLETE-phase reply, shared by text and media: re-send the
+        stored profile (or fail loud if it is missing) — never a bare 'Hi Mate'
+        without a trace (TECH.md: fail loud, no un-logged fallbacks)."""
+        if state.profile is None:
+            logger.error(
+                "event=interview_complete_missing_profile chat_id=%s update_id=%d",
                 chat_id,
                 update_id,
             )
-            return True
-        # IDLE (or any unknown phase): the Phase-1 confirmation reply, unchanged.
-        return self._reply_confirmation(chat_id, update_id)
+            return self._reply_confirmation(chat_id, update_id)
+        self._client.send_message(chat_id, state.profile.summary)
+        logger.info(
+            "event=interview_profile_resent chat_id=%s update_id=%d",
+            chat_id,
+            update_id,
+        )
+        return True
 
     def _reply_confirmation(self, chat_id: int, update_id: int) -> bool:
         self._client.send_message(chat_id, self._reply_text)
@@ -246,6 +338,7 @@ class Gateway:
                 update_id,
             )
             self._client.send_message(chat_id, INTERVIEWER_REPLY_UNAVAILABLE)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return True
         for outbound in reply.messages:
             self._client.send_message(chat_id, outbound)
@@ -273,6 +366,7 @@ class Gateway:
                 update_id,
             )
             self._client.send_message(chat_id, CONVERTER_REPLY_UNAVAILABLE)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return
 
         try:
@@ -292,6 +386,7 @@ class Gateway:
                 update_id,
             )
             self._client.send_message(chat_id, CONVERTER_REPLY_UNAVAILABLE)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return
 
         logger.info(
@@ -309,6 +404,7 @@ class Gateway:
                 update_id,
             )
             self._client.send_message(chat_id, CONVERTER_REPLY_UNAVAILABLE)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return
 
         try:
@@ -321,6 +417,7 @@ class Gateway:
                 len(hybrid),
             )
             self._client.send_message(chat_id, CONVERTER_REPLY_UNAVAILABLE)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return
 
         logger.info(
@@ -359,6 +456,7 @@ class Gateway:
                 update_id,
             )
             self._client.send_message(chat_id, SCRIPTER_REPLY_UNAVAILABLE)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return
 
         logger.info(
@@ -373,6 +471,7 @@ class Gateway:
                 update_id,
             )
             self._client.send_message(chat_id, SCRIPTER_REPLY_UNAVAILABLE)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return
 
         try:
@@ -441,6 +540,7 @@ class Gateway:
                 update_id,
             )
             self._client.send_message(chat_id, NARRATOR_REPLY_UNAVAILABLE)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return
 
         logger.info(
@@ -455,6 +555,7 @@ class Gateway:
                 update_id,
             )
             self._client.send_message(chat_id, NARRATOR_REPLY_UNAVAILABLE)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return
 
         logger.info(
@@ -511,6 +612,17 @@ class Gateway:
                 logger.exception(
                     "event=converter_session_reset_failed chat_id=%s", chat_id
                 )
+        if self._scripter is not None:
+            try:
+                self._scripter.reset_chat(chat_id)
+            except Exception:
+                logger.exception(
+                    "event=scripter_session_reset_failed chat_id=%s", chat_id
+                )
+        try:
+            self._temp_assets.purge(chat_id)
+        except Exception:
+            logger.exception("event=temp_assets_purge_failed chat_id=%s", chat_id)
         self._client.send_message(chat_id, INTERVIEWER_REPLY_RESET)
         logger.info("event=reset_command chat_id=%s update_id=%d", chat_id, update_id)
         return True
@@ -531,17 +643,33 @@ class Gateway:
         rejection + Bouncer session and interview state reset. Failure at any
         step → graceful reply, no reset, loop survives.
         """
+        # Check interview phase first - if not IDLE, reject photo mid-interview
+        if self._interviewer is not None:
+            try:
+                state = self._interviewer.state(chat_id)
+                if state.phase is not InterviewPhase.IDLE:
+                    self._client.send_message(chat_id, GATEWAY_REPLY_PHOTO_DURING_INTERVIEW)
+                    return True
+            except Exception:
+                logger.exception(
+                    "event=interview_state_failed chat_id=%s update_id=%d",
+                    chat_id,
+                    update_id,
+                )
+
         if self._bouncer is None:
             logger.error(
                 "event=photo_no_bouncer chat_id=%s update_id=%d", chat_id, update_id
             )
             self._client.send_message(chat_id, BOUNCER_UNAVAILABLE_REPLY)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return True
         if not message.photo:
             logger.error(
                 "event=photo_empty chat_id=%s update_id=%d", chat_id, update_id
             )
             self._client.send_message(chat_id, BOUNCER_UNAVAILABLE_REPLY)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return True
         try:
             largest = max(message.photo, key=lambda p: p.width * p.height)
@@ -554,12 +682,14 @@ class Gateway:
                 "event=photo_download_failed chat_id=%s update_id=%d", chat_id, update_id
             )
             self._client.send_message(chat_id, BOUNCER_UNAVAILABLE_REPLY)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return True
         except Exception:
             logger.exception(
                 "event=photo_download_failed chat_id=%s update_id=%d", chat_id, update_id
             )
             self._client.send_message(chat_id, BOUNCER_UNAVAILABLE_REPLY)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return True
 
         try:
@@ -569,6 +699,7 @@ class Gateway:
                 "event=photo_classify_failed chat_id=%s update_id=%d", chat_id, update_id
             )
             self._client.send_message(chat_id, BOUNCER_UNAVAILABLE_REPLY)
+            self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return True
 
         if decision.human_present:
@@ -597,11 +728,17 @@ class Gateway:
                         update_id,
                     )
             self._client.send_message(chat_id, self._reply_text)
-            self._client.send_message(chat_id, HUMAN_VERDICT_REPLY)
+            self._client.send_message(
+                chat_id,
+                HUMAN_VERDICT_REPLY_LOCAL
+                if decision.source == "local"
+                else HUMAN_VERDICT_REPLY,
+            )
             logger.info(
-                "event=photo_verdict_sent update_id=%d chat_id=%s verdict=human",
+                "event=photo_verdict_sent update_id=%d chat_id=%s verdict=human source=%s",
                 update_id,
                 chat_id,
+                decision.source,
             )
             # Approved photo = the interview's entry point: Q1 after the verdict.
             if self._interviewer is not None:
@@ -615,6 +752,7 @@ class Gateway:
                         update_id,
                     )
                     self._client.send_message(chat_id, INTERVIEWER_REPLY_UNAVAILABLE)
+                    self._client.send_message(chat_id, GATEWAY_REPLY_RETRY_HINT)
             return True
 
         logger.info(
@@ -624,11 +762,17 @@ class Gateway:
             decision.reason,
         )
         self._client.send_message(chat_id, BOUNCER_REJECTION)
-        self._client.send_message(chat_id, NON_HUMAN_VERDICT_REPLY)
+        self._client.send_message(
+            chat_id,
+            NON_HUMAN_VERDICT_REPLY_LOCAL
+            if decision.source == "local"
+            else NON_HUMAN_VERDICT_REPLY,
+        )
         logger.info(
-            "event=photo_verdict_sent update_id=%d chat_id=%s verdict=non_human",
+            "event=photo_verdict_sent update_id=%d chat_id=%s verdict=non_human source=%s",
             update_id,
             chat_id,
+            decision.source,
         )
         try:
             self._bouncer.reset_chat(chat_id)

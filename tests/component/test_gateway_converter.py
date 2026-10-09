@@ -9,12 +9,12 @@ import logging
 
 from src.bouncer import (
     BOUNCER_REJECTION,
-    BouncerDecision,
     HUMAN_VERDICT_REPLY,
     NON_HUMAN_VERDICT_REPLY,
+    BouncerDecision,
 )
 from src.converter import CONVERTER_REPLY_UNAVAILABLE, ConverterError
-from src.gateway import Gateway, REPLY_TEXT
+from src.gateway import GATEWAY_REPLY_RETRY_HINT, REPLY_TEXT, Gateway
 from src.interview_state import (
     InterviewPhase,
     InterviewState,
@@ -24,11 +24,18 @@ from src.interview_state import (
 from src.interviewer import (
     INTERVIEW_QUESTIONS,
     INTERVIEWER_REPLY_RESET,
-    InterviewReply,
     Interviewer,
+    InterviewReply,
 )
 from src.portrait_store import PortraitStore
-from src.telegram_models import Chat, Message, PhotoSize, TelegramAPIError, TelegramFile, Update
+from src.telegram_models import (
+    Chat,
+    Message,
+    PhotoSize,
+    TelegramAPIError,
+    TelegramFile,
+    Update,
+)
 
 PHOTO_BYTES = b"image-bytes"
 HYBRID_BYTES = b"hybrid-bytes"
@@ -322,7 +329,10 @@ def test_converter_failure_degrades_gracefully_and_loop_survives(caplog):
         _run_full_interview(gateway, client, chat_id=333, first_update=50)
 
     assert client.sent_photos == []
-    assert client.sent[-1] == (333, CONVERTER_REPLY_UNAVAILABLE)
+    assert client.sent[-2:] == [
+        (333, CONVERTER_REPLY_UNAVAILABLE),
+        (333, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert any("event=converter_failed" in r.message for r in caplog.records)
 
     # The loop survives: a later update is still processed.
@@ -348,7 +358,10 @@ def test_send_photo_failure_is_logged_and_loop_survives(caplog):
         _run_full_interview(gateway, client, chat_id=334, first_update=70)
 
     assert client.sent_photos == []
-    assert client.sent[-1] == (334, CONVERTER_REPLY_UNAVAILABLE)
+    assert client.sent[-2:] == [
+        (334, CONVERTER_REPLY_UNAVAILABLE),
+        (334, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert any(
         "event=converter_failed" in r.message and "stage=send_photo" in r.message
         for r in caplog.records
@@ -381,7 +394,10 @@ def test_completion_with_no_saved_portrait_is_unavailable_and_logged(caplog):
             gateway.poll_once()
 
     assert client.sent_photos == []
-    assert client.sent[-1] == (444, CONVERTER_REPLY_UNAVAILABLE)
+    assert client.sent[-2:] == [
+        (444, CONVERTER_REPLY_UNAVAILABLE),
+        (444, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert any("event=converter_portrait_missing" in r.message for r in caplog.records)
 
 
@@ -401,7 +417,10 @@ def test_complete_without_profile_is_unavailable_and_logged(caplog):
         gateway.poll_once()
 
     assert client.sent_photos == []
-    assert client.sent[-1] == (555, CONVERTER_REPLY_UNAVAILABLE)
+    assert client.sent[-2:] == [
+        (555, CONVERTER_REPLY_UNAVAILABLE),
+        (555, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert any("event=converter_profile_missing" in r.message for r in caplog.records)
 
 
@@ -433,10 +452,14 @@ def test_restart_purges_the_stored_portrait_and_converter_session():
 
 
 def test_rejected_photo_purges_the_stored_portrait_and_converter_session():
+    """Rejection is only reachable when no interview is in progress (Phase 7
+    decision: photos during an interview are refused, always). A rejection must
+    still purge any stored portrait and the converter session."""
     client = GateClient()
-    bouncer = FakeBouncer(verdicts=[True, False])
+    bouncer = FakeBouncer(verdicts=[False])
     interviewer = Interviewer(store=InterviewStateStore())
     portraits = PortraitStore()
+    portraits.save(777, PHOTO_BYTES)  # a portrait stored by an earlier approval
     converter = FakeConverter()
     gateway = Gateway(
         client,
@@ -445,23 +468,13 @@ def test_rejected_photo_purges_the_stored_portrait_and_converter_session():
         converter=converter,
         portraits=portraits,
     )
-    client.queue([_photo_update(120, chat_id=777)])
-    gateway.poll_once()
-    client.queue([_text_update(121, chat_id=777, text="mid answer")])
-    gateway.poll_once()
-    assert portraits.get(777) == PHOTO_BYTES
 
-    client.queue([_photo_update(122, chat_id=777)])  # non-human → rejected
+    client.queue([_photo_update(120, chat_id=777)])  # non-human -> rejected
     gateway.poll_once()
 
     assert client.sent[-2:] == [(777, BOUNCER_REJECTION), (777, NON_HUMAN_VERDICT_REPLY)]
     assert portraits.get(777) is None
     assert converter.resets == [777]
-
-    # A later completion cannot produce an image (portrait was purged).
-    client.queue([_text_update(123, chat_id=777, text="/restart")])
-    gateway.poll_once()
-    assert portraits.get(777) is None
 
 
 def test_reset_purges_only_the_reset_chats_portrait():

@@ -5,17 +5,26 @@ test is real. Mirrors the phase-1 polling-loop tests' style.
 """
 import logging
 
-import pytest
-
 from src.bouncer import (
     BOUNCER_REJECTION,
     BOUNCER_UNAVAILABLE_REPLY,
-    BouncerDecision,
     HUMAN_VERDICT_REPLY,
+    HUMAN_VERDICT_REPLY_LOCAL,
     NON_HUMAN_VERDICT_REPLY,
+    NON_HUMAN_VERDICT_REPLY_LOCAL,
+    BouncerDecision,
 )
-from src.gateway import Gateway, REPLY_TEXT
-from src.telegram_models import Chat, Message, PhotoSize, TelegramAPIError, TelegramFile, Update
+from src.gateway import GATEWAY_REPLY_RETRY_HINT, REPLY_TEXT, Gateway
+from src.interview_state import InterviewStateStore
+from src.interviewer import INTERVIEW_QUESTIONS, Interviewer
+from src.telegram_models import (
+    Chat,
+    Message,
+    PhotoSize,
+    TelegramAPIError,
+    TelegramFile,
+    Update,
+)
 
 
 class GateClient:
@@ -50,10 +59,22 @@ class GateClient:
 
 
 class FakeBouncer:
-    """Scripted bouncer: preset verdicts per call, recorded resets."""
+    """Scripted bouncer: preset verdicts per call, recorded resets.
 
-    def __init__(self, verdicts: list[bool], *, classify_raises: Exception | None = None) -> None:
+    ``source`` models which judge produced the verdict — ``"gemini"`` or the
+    key-free local face-check fallback — so the gateway's honest offline
+    labelling can be exercised.
+    """
+
+    def __init__(
+        self,
+        verdicts: list[bool],
+        *,
+        source: str = "gemini",
+        classify_raises: Exception | None = None,
+    ) -> None:
         self._verdicts = list(verdicts)
+        self._source = source
         self._classify_raises = classify_raises
         self.classify_calls: list[tuple[int, int]] = []  # (bytes_len, chat_id)
         self.resets: list[int] = []
@@ -66,6 +87,7 @@ class FakeBouncer:
         return BouncerDecision(
             human_present=human_present,
             reason="clear face" if human_present else "no humans here",
+            source=self._source,
         )
 
     def reset_chat(self, chat_id: int) -> None:
@@ -163,6 +185,63 @@ def test_photo_with_caption_is_gated_not_replied_to_directly():
     assert client.sent == [(666, REPLY_TEXT), (666, HUMAN_VERDICT_REPLY)]
 
 
+# --- offline verdict labelling --------------------------------------------------
+# A verdict from the key-free local fallback must announce itself as such; a
+# Gemini verdict keeps the standard copy. (An animal can pass the weak offline
+# face gate — the chat must not misrepresent that as a Gemini verdict.)
+
+
+def test_local_verdict_sends_offline_face_check_message(caplog):
+    client = GateClient()
+    bouncer = FakeBouncer(verdicts=[True], source="local")
+    interviewer = Interviewer(store=InterviewStateStore())
+    gateway = Gateway(client, bouncer=bouncer, interviewer=interviewer)
+
+    client.queue([_photo_update(3, chat_id=901, sizes=[("f", 100, 100)])])
+    with caplog.at_level(logging.INFO):
+        gateway.poll_once()
+
+    assert client.sent == [
+        (901, REPLY_TEXT),
+        (901, HUMAN_VERDICT_REPLY_LOCAL),
+        (901, INTERVIEW_QUESTIONS[0]),
+    ]
+    assert any(
+        "event=photo_verdict_sent" in r.message and "source=local" in r.message
+        for r in caplog.records
+    )
+
+
+def test_local_non_human_verdict_sends_offline_face_check_message():
+    client = GateClient()
+    bouncer = FakeBouncer(verdicts=[False], source="local")
+    gateway = Gateway(client, bouncer=bouncer)
+
+    client.queue([_photo_update(4, chat_id=902, sizes=[("f", 100, 100)])])
+    gateway.poll_once()
+
+    assert client.sent == [
+        (902, BOUNCER_REJECTION),
+        (902, NON_HUMAN_VERDICT_REPLY_LOCAL),
+    ]
+
+
+def test_gemini_verdict_keeps_the_standard_message(caplog):
+    client = GateClient()
+    bouncer = FakeBouncer(verdicts=[True], source="gemini")
+    gateway = Gateway(client, bouncer=bouncer)
+
+    client.queue([_photo_update(5, chat_id=903, sizes=[("f", 100, 100)])])
+    with caplog.at_level(logging.INFO):
+        gateway.poll_once()
+
+    assert client.sent == [(903, REPLY_TEXT), (903, HUMAN_VERDICT_REPLY)]
+    assert any(
+        "event=photo_verdict_sent" in r.message and "source=gemini" in r.message
+        for r in caplog.records
+    )
+
+
 # --- degradation paths ---------------------------------------------------------
 
 
@@ -174,7 +253,10 @@ def test_photo_without_bouncer_replies_unavailable_and_logs(caplog):
         replied = _poll(Gateway(client, bouncer=None))
 
     assert replied == 1
-    assert client.sent == [(777, BOUNCER_UNAVAILABLE_REPLY)]
+    assert client.sent == [
+        (777, BOUNCER_UNAVAILABLE_REPLY),
+        (777, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert any("event=photo_no_bouncer" in r.message for r in caplog.records)
 
 
@@ -187,7 +269,10 @@ def test_photo_download_failure_replies_unavailable_and_skips_bouncer(caplog):
         replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(888, BOUNCER_UNAVAILABLE_REPLY)]
+    assert client.sent == [
+        (888, BOUNCER_UNAVAILABLE_REPLY),
+        (888, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert bouncer.classify_calls == []  # gate stopped before the LLM
     assert bouncer.resets == []  # a failure never resets state (decision #4)
     assert any("event=photo_download_failed" in r.message for r in caplog.records)
@@ -205,7 +290,10 @@ def test_photo_get_file_without_path_treated_as_download_failure():
     replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(999, BOUNCER_UNAVAILABLE_REPLY)]
+    assert client.sent == [
+        (999, BOUNCER_UNAVAILABLE_REPLY),
+        (999, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert bouncer.classify_calls == []
     assert bouncer.resets == []
 
@@ -219,7 +307,10 @@ def test_empty_photo_list_is_gated_not_approved_as_text():
     replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(1515, BOUNCER_UNAVAILABLE_REPLY)]
+    assert client.sent == [
+        (1515, BOUNCER_UNAVAILABLE_REPLY),
+        (1515, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert bouncer.classify_calls == []
     assert bouncer.resets == []
 
@@ -239,7 +330,10 @@ def test_unexpected_download_failure_still_replies_gracefully(caplog):
         replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(1616, BOUNCER_UNAVAILABLE_REPLY)]
+    assert client.sent == [
+        (1616, BOUNCER_UNAVAILABLE_REPLY),
+        (1616, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert bouncer.classify_calls == []
     assert bouncer.resets == []
     assert any("event=photo_download_failed" in r.message for r in caplog.records)
@@ -254,7 +348,10 @@ def test_photo_classify_failure_replies_unavailable_without_reset(caplog):
         replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(1010, BOUNCER_UNAVAILABLE_REPLY)]
+    assert client.sent == [
+        (1010, BOUNCER_UNAVAILABLE_REPLY),
+        (1010, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert bouncer.resets == []  # unknown verdict → no state reset
     assert any("event=photo_classify_failed" in r.message for r in caplog.records)
 
@@ -287,7 +384,11 @@ def test_loop_survives_photo_gate_problems_and_keeps_polling():
 
     assert gateway.poll_once() == 1  # photo: graceful unavailable
     assert gateway.poll_once() == 1  # following text batch: normal reply
-    assert client.sent == [(1212, BOUNCER_UNAVAILABLE_REPLY), (1313, REPLY_TEXT)]
+    assert client.sent == [
+        (1212, BOUNCER_UNAVAILABLE_REPLY),
+        (1212, GATEWAY_REPLY_RETRY_HINT),
+        (1313, REPLY_TEXT),
+    ]
 
 
 def test_offset_advances_even_for_rejected_photo():

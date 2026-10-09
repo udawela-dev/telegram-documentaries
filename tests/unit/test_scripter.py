@@ -335,6 +335,27 @@ def test_every_write_starts_from_a_fresh_reaped_session():
     assert scripter._sessions.list_sessions_sync(app_name=APP, user_id="111").sessions == []
 
 
+def test_reset_chat_reaps_the_chats_adk_session_idempotently(caplog):
+    """A reset purges the chat's ADK session; repeating it (or resetting a chat
+    that never started) is harmless — the sweep is chat-scoped and idempotent."""
+    caplog.set_level(logging.INFO)
+    store = InterviewStateStore()
+    profile = _profile()
+    _save_state(store, 333, profile)
+    scripter = ScriptedScripter(api_key="x", store=store)
+
+    scripter.write_script(333, profile)
+    # A session was created for the write; the reset must reap it.
+    scripter.reset_chat(333)
+    assert scripter._sessions.list_sessions_sync(app_name=APP, user_id="333").sessions == []
+    assert any("event=scripter_session_reset" in r.message for r in caplog.records)
+
+    # Idempotent: a second reset, or resetting a never-used chat, is a no-op.
+    scripter.reset_chat(333)
+    scripter.reset_chat(444)
+    assert any("event=scripter_session_reset" in r.message for r in caplog.records)
+
+
 # --- local-writer fallback ------------------------------------------------------
 
 

@@ -59,6 +59,7 @@ from src.narrator import Narrator
 from src.portrait_store import PortraitStore
 from src.scripter import Scripter
 from src.telegram_client import TelegramClient
+from src.temp_assets import TempAssets
 
 
 def main() -> int:
@@ -161,11 +162,21 @@ def main() -> int:
     if not settings.gemini_api_key:
         logger.warning("event=scripter_local_only reason=missing_gemini_api_key")
 
+    # Phase 7: one shared per-chat temp-asset registry. The Narrator tracks its
+    # staged audio files so a reset can sweep anything an interrupted worker
+    # left behind; the Gateway purges it on /start and /restart. Same instance
+    # in both, so purge reaches exactly the files this process staged.
+    temp_assets = TempAssets()
+
     # The Narrator (Phase 6) is a DIRECT Gemini TTS call — no agent, and no
     # local/key-free fallback (locked decision). It reads the script the
     # Scripter stored on the SAME shared state driver. Model/voice/timeout are
     # resolved from NARRATOR_MODEL / NARRATOR_VOICE / NARRATOR_GEMINI_TIMEOUT.
-    narrator = Narrator(api_key=settings.gemini_api_key, store=interview_store)
+    narrator = Narrator(
+        api_key=settings.gemini_api_key,
+        store=interview_store,
+        temp_assets=temp_assets,
+    )
     if settings.gemini_api_key:
         logger.info(
             "event=narrator_ready model=%s voice=%s", narrator.model, narrator.voice
@@ -184,6 +195,7 @@ def main() -> int:
         portraits=portraits,
         scripter=scripter,
         narrator=narrator,
+        temp_assets=temp_assets,
     )
     try:
         gateway.run(stop_event)

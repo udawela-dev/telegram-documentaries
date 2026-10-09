@@ -24,7 +24,7 @@ from test_gateway_scripter import (
     GateClient as _BaseGateClient,
 )
 
-from src.gateway import Gateway
+from src.gateway import GATEWAY_REPLY_RETRY_HINT, Gateway
 from src.interview_state import InterviewStateStore
 from src.interviewer import INTERVIEWER_REPLY_RESET, Interviewer
 from src.narrator import NARRATOR_REPLY_UNAVAILABLE, NarratorError
@@ -173,7 +173,10 @@ def test_synth_failure_sends_unavailable_and_loop_survives(caplog):
         _run_full_interview(gateway, client, chat_id=444, first_update=90)
 
     assert client.sent_voices == []
-    assert client.sent[-1] == (444, NARRATOR_REPLY_UNAVAILABLE)
+    assert client.sent[-2:] == [
+        (444, NARRATOR_REPLY_UNAVAILABLE),
+        (444, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert gateway._interviewer.state(444).script == SCRIPT  # script stays on state
     assert any("event=narrator_failed" in r.message for r in caplog.records)
 
@@ -225,7 +228,10 @@ def test_missing_script_sends_unavailable_without_calling_tts(caplog):
 
     assert client.sent_voices == []
     assert gateway._interviewer.state(666).script is None
-    assert client.sent[-1] == (666, NARRATOR_REPLY_UNAVAILABLE)
+    assert client.sent[-2:] == [
+        (666, NARRATOR_REPLY_UNAVAILABLE),
+        (666, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert narrator.calls == []  # no TTS without a script
     assert any(
         "event=narrator_failed" in r.message and "reason=missing_script" in r.message

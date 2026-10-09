@@ -16,7 +16,7 @@ from src.bouncer import (
     BouncerDecision,
 )
 from src.converter import CONVERTER_REPLY_UNAVAILABLE
-from src.gateway import Gateway
+from src.gateway import GATEWAY_REPLY_RETRY_HINT, Gateway
 from src.interview_state import InterviewStateStore
 from src.interviewer import INTERVIEWER_REPLY_RESET, Interviewer
 from src.portrait_store import PortraitStore
@@ -237,7 +237,10 @@ def test_scripter_failure_sends_unavailable_and_leaves_state_untouched(caplog):
         _run_full_interview(gateway, client, chat_id=333, first_update=50)
 
     assert client.sent_photos == [(333, HYBRID_BYTES)]  # photo still delivered
-    assert client.sent[-1] == (333, SCRIPTER_REPLY_UNAVAILABLE)
+    assert client.sent[-2:] == [
+        (333, SCRIPTER_REPLY_UNAVAILABLE),
+        (333, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert interviewer.state(333).script is None
     assert any("event=script_failed" in r.message for r in caplog.records)
 
@@ -344,7 +347,10 @@ def test_converter_failure_does_not_invoke_the_scripter(caplog):
         _run_full_interview(gateway, client, chat_id=334, first_update=70)
 
     assert client.sent_photos == []
-    assert client.sent[-1] == (334, CONVERTER_REPLY_UNAVAILABLE)
+    assert client.sent[-2:] == [
+        (334, CONVERTER_REPLY_UNAVAILABLE),
+        (334, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert scripter.calls == []
     assert interviewer.state(334).script is None
 
@@ -368,7 +374,10 @@ def test_send_photo_failure_does_not_invoke_the_scripter(caplog):
         _run_full_interview(gateway, client, chat_id=336, first_update=110)
 
     assert client.sent_photos == []
-    assert client.sent[-1] == (336, CONVERTER_REPLY_UNAVAILABLE)
+    assert client.sent[-2:] == [
+        (336, CONVERTER_REPLY_UNAVAILABLE),
+        (336, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert scripter.calls == []
     assert interviewer.state(336).script is None
 

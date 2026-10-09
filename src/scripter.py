@@ -185,6 +185,11 @@ class Scripter:
                 app_name=APP_NAME, user_id=session_id, session_id=session_id
             )
 
+    def reset_chat(self, chat_id: int) -> None:
+        """Purge the chat's ADK session (called on resets). Idempotent and chat-scoped."""
+        self._delete_session(chat_id)
+        logger.info("event=scripter_session_reset chat_id=%d", chat_id)
+
     def _fresh_session(self, chat_id: int) -> str:
         """Return a brand-new per-chat session, discarding any previous one.
 

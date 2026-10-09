@@ -18,7 +18,7 @@ The model reads the API key from the environment (``GEMINI_API_KEY`` in
 
 Resilience: a Gemini call must finish within ``BOUNCER_GEMINI_TIMEOUT``
 seconds (default 60); on any agent failure (blocked key, network, timeout) the
-Bouncer falls back to a key-free ``LocalVisionClassifier`` (OpenCV Haar face
+Bouncer falls back to a key-free ``LocalVisionClassifier`` (YuNet face
 detection) that still returns a real human/non-human verdict — so the gate
 keeps working even while Gemini is unreachable. The fallback is only invoked
 when Gemini cannot answer; if neither Gemini nor a local classifier is
@@ -32,7 +32,7 @@ import logging
 import os
 import re
 import threading
-from typing import Any
+from typing import Any, Literal
 
 from google.adk.agents import LlmAgent
 from google.adk.runners import Runner
@@ -79,6 +79,15 @@ BOUNCER_UNAVAILABLE_REPLY = (
 HUMAN_VERDICT_REPLY = "Human detected ✓"
 NON_HUMAN_VERDICT_REPLY = "Non-human detected"
 
+# Offline verdict labels (2026-10-09): when the verdict came from the key-free
+# local face detector (Gemini unreachable), the announcement says so. The local
+# detector only finds *faces* and cannot discriminate animal faces from human
+# ones, so an animal can pass this weak gate; labelling the source keeps the
+# chat honest about how the verdict was reached (the real discriminator is
+# Gemini). These never replace the standard copy above for Gemini verdicts.
+HUMAN_VERDICT_REPLY_LOCAL = "Human detected ✓ (offline face check)"
+NON_HUMAN_VERDICT_REPLY_LOCAL = "Non-human detected (offline face check)"
+
 INSTRUCTION = (
     "You are The Bouncer, the front gate of a wildlife-documentary Telegram bot. "
     "A user has uploaded a photograph. Classify whether the image contains at "
@@ -98,12 +107,19 @@ DEFAULT_GEMINI_TIMEOUT_SECONDS = 60.0
 
 
 class BouncerDecision(BaseModel):
-    """Typed verdict parsed from the agent's strict-JSON reply."""
+    """Typed verdict parsed from the agent's strict-JSON reply.
+
+    ``source`` records which judge produced the verdict: ``"gemini"`` for the
+    primary ADK/Gemini agent (and every reject-safe parse path), ``"local"``
+    for the key-free local face-detector fallback. Defaulting to ``"gemini"``
+    keeps all existing Gemini parse paths tagged correctly.
+    """
 
     model_config = ConfigDict(extra="ignore", strict=True)
 
     human_present: bool
     reason: str = ""
+    source: Literal["gemini", "local"] = "gemini"
 
 
 def parse_decision(text: str) -> BouncerDecision:
@@ -137,7 +153,16 @@ def parse_decision(text: str) -> BouncerDecision:
         return BouncerDecision(human_present=False, reason="model output was not a JSON object")
 
     try:
-        return BouncerDecision.model_validate(data)
+        # Provenance is code-assigned, never model-parsed: build the decision from
+        # only the model-owned keys and pass ``source="gemini"`` explicitly. The
+        # model cannot smuggle ``"source": "local"`` in (a declared field would
+        # otherwise survive ``extra="ignore"`` and trigger the offline copy for a
+        # real Gemini verdict). Only ``_local_verdict`` may set ``"local"``.
+        return BouncerDecision(
+            human_present=data.get("human_present"),
+            reason=data.get("reason", ""),
+            source="gemini",
+        )
     except ValidationError as exc:
         logger.warning(
             "event=bouncer_invalid_decision treating_as_rejected errors=%s",
@@ -283,7 +308,7 @@ class Bouncer:
         logger.info(
             "event=bouncer_local_verdict chat_id=%d human_present=%s", chat_id, human
         )
-        return BouncerDecision(human_present=human, reason=reason)
+        return BouncerDecision(human_present=human, reason=reason, source="local")
 
     def _llm_classify(self, image_bytes: bytes, session_id: str, mime_type: str) -> str:
         """Run the ADK agent once; return the final response text.
