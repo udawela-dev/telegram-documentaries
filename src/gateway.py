@@ -1,4 +1,5 @@
-"""Phase 1+2+3+4+5 gateway: long-polling loop + dispatcher (Bouncer → Interviewer → Converter → Scripter).
+"""Phase 1+2+3+4+5+6 gateway: long-polling loop + dispatcher
+(Bouncer → Interviewer → Converter → Scripter → Narrator).
 
 Behaviour contract:
 * every TEXT message gets the confirmation reply — no state, no branching —
@@ -28,6 +29,17 @@ Behaviour contract:
   failure → loud ``event=script_send_failed`` log, no misleading apology (the
   script was produced and stored; only the send failed), loop survives. With
   no scripter wired, completion is exactly Phase 4;
+* after the script text (Phase 6) the Narrator renders the stored
+  ``state.script`` to a Telegram voice note (final chat order: profile text →
+  hybrid photo → script text → voice note — asserted via the component suite)
+  and sends it with ``send_voice``. Missing script → loud
+  ``narrator_failed reason=missing_script`` + ``NARRATOR_REPLY_UNAVAILABLE``
+  (no TTS attempted); synthesis failure (blocked key, API error, timeout,
+  missing ffmpeg when conversion is needed) → loud failure +
+  ``NARRATOR_REPLY_UNAVAILABLE``; a ``sendVoice`` delivery failure → loud
+  ``narrator_send_failed`` log, no misleading apology (TTS produced bytes; the
+  script stays on state), loop survives. With no narrator wired, completion is
+  exactly Phases 1-5;
 * ``/start`` and ``/restart`` (with an interviewer wired) reset both stages and
   purge the stored portrait, then send a confirmation reply; without an
   interviewer every text, commands included, gets the confirmation reply
@@ -56,6 +68,7 @@ from src.bouncer import (
 from src.converter import CONVERTER_REPLY_UNAVAILABLE
 from src.interview_state import InterviewPhase
 from src.interviewer import INTERVIEWER_REPLY_RESET, INTERVIEWER_REPLY_UNAVAILABLE
+from src.narrator import NARRATOR_REPLY_UNAVAILABLE
 from src.scripter import SCRIPTER_REPLY_UNAVAILABLE
 from src.telegram_models import Message, TelegramAPIError, Update
 
@@ -74,6 +87,7 @@ class Gateway:
         converter=None,
         portraits=None,
         scripter=None,
+        narrator=None,
         reply_text: str = REPLY_TEXT,
         poll_timeout: int = 30,
         backoff_seconds: float = 0.5,
@@ -89,6 +103,9 @@ class Gateway:
         # Phase 5: the scripter. When None, completion is exactly Phases 3+4
         # (no script produced or sent).
         self._scripter = scripter
+        # Phase 6: the narrator. When None, completion is exactly Phases 1-5
+        # (no voice note).
+        self._narrator = narrator
         self._reply_text = reply_text
         self._poll_timeout = poll_timeout
         self._backoff_seconds = backoff_seconds
@@ -371,6 +388,102 @@ class Gateway:
                 update_id,
                 type(exc).__name__,
             )
+
+        # Phase 6: after the script text (the third message) render + deliver the
+        # voice note (the fourth message). The narration reads the script the
+        # Scripter stored on the shared driver.
+        self._handle_narration(chat_id, update_id)
+
+    def _read_stored_script(self, chat_id: int, update_id: int) -> str | None:
+        """Read ``state.script`` from the shared driver (Phase 5 hand-off).
+
+        The gateway does not own a store directly; the Interviewer holds the one
+        shared state driver every stage writes to. Any read failure is loud but
+        returns ``None`` so narration degrades to the locked unavailable reply.
+        """
+        if self._interviewer is None:
+            logger.error(
+                "event=narrator_failed chat_id=%s update_id=%d reason=no_interviewer",
+                chat_id,
+                update_id,
+            )
+            return None
+        try:
+            return self._interviewer.state(chat_id).script
+        except Exception:
+            logger.exception(
+                "event=narrator_failed chat_id=%s update_id=%d reason=state_read",
+                chat_id,
+                update_id,
+            )
+            return None
+
+    def _handle_narration(self, chat_id: int, update_id: int) -> None:
+        """Render + send the voice note after the script text (Phase 6).
+
+        Inactive when no narrator is wired — exactly Phases 1-5. Missing script →
+        loud ``narrator_failed reason=missing_script`` + ``NARRATOR_REPLY_UNAVAILABLE``
+        (no TTS attempted). Synthesis failure (blocked key, API error, timeout,
+        missing ffmpeg when conversion is needed) → loud failure +
+        ``NARRATOR_REPLY_UNAVAILABLE``. A pure ``sendVoice`` *delivery* failure →
+        loud ``narrator_send_failed`` log and NO apology (the script was produced
+        and stays on state; TTS may have succeeded, so the apology would
+        mislead). The polling loop always survives.
+        """
+        if self._narrator is None:
+            return  # Phases-1-5 regression: no narrator, no extra replies/events
+
+        script = self._read_stored_script(chat_id, update_id)
+        if not script:
+            logger.error(
+                "event=narrator_failed chat_id=%s update_id=%d reason=missing_script",
+                chat_id,
+                update_id,
+            )
+            self._client.send_message(chat_id, NARRATOR_REPLY_UNAVAILABLE)
+            return
+
+        logger.info(
+            "event=narrator_started chat_id=%s update_id=%d", chat_id, update_id
+        )
+        try:
+            audio = self._narrator.synthesize(chat_id, script)
+        except Exception:
+            logger.exception(
+                "event=narrator_failed chat_id=%s update_id=%d stage=synthesize",
+                chat_id,
+                update_id,
+            )
+            self._client.send_message(chat_id, NARRATOR_REPLY_UNAVAILABLE)
+            return
+
+        logger.info(
+            "event=narrator_generated chat_id=%s update_id=%d bytes=%d",
+            chat_id,
+            update_id,
+            len(audio) if audio else 0,
+        )
+        try:
+            self._client.send_voice(chat_id, audio)
+        except Exception as exc:
+            # TTS produced bytes; only delivery failed. Do NOT send
+            # NARRATOR_REPLY_UNAVAILABLE ("lost his voice") — it would mislead,
+            # since the note may have partly delivered. The script stays on
+            # state and the loop survives.
+            logger.exception(
+                "event=narrator_send_failed chat_id=%s update_id=%d error_type=%s",
+                chat_id,
+                update_id,
+                type(exc).__name__,
+            )
+            return
+
+        logger.info(
+            "event=narrator_sent chat_id=%s update_id=%d bytes=%d",
+            chat_id,
+            update_id,
+            len(audio) if audio else 0,
+        )
 
     def _handle_reset_command(self, chat_id: int, update_id: int) -> bool:
         """``/start`` or ``/restart``: purge Bouncer session + Interviewer state.

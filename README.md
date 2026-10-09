@@ -3,7 +3,7 @@
 Send a portrait to a Telegram bot and receive a narrated, comedy-wildlife
 documentary about yourself.
 
-**Current state: Phases 1 + 2 + 3 + 4 + 5.**
+**Current state: Phases 1 + 2 + 3 + 4 + 5 + 6.**
 
 - **Phase 1 — the gateway.** A long-polling loop (`src/gateway.py`) that
   replies to text messages with `"Hi Mate"`.
@@ -42,6 +42,19 @@ documentary about yourself.
   output breaks the one-paragraph/word-budget contract; a local validator
   (`validate_script`) is the single shape gate for both paths, so an
   off-spec "script" is never stored or spoken.
+- **Phase 6 — The Narrator.** The voice (`src/narrator.py`): **directly** — not
+  as an ADK agent — calls **Gemini 3.1 Flash TTS** (`gemini-3.1-flash-tts-preview`,
+  `response_modalities=["AUDIO"]` + a single-speaker prebuilt voice) with the
+  stored script as input, and delivers the resulting narration as a Telegram
+  **voice note** via `send_voice` — the fourth and final message of a run.
+  Voice direction is a deep male, posh-British wildlife-documentary presenter
+  (prebuilt voice + persona instruction; `NARRATOR_VOICE` overridable). Audio
+  is staged through temp files with cleanup in a `finally` on success and
+  error; if the API returns a non-voice-note format it is converted to
+  OGG/Opus via ffmpeg (missing ffmpeg → graceful unavailable, never silent).
+  **No local/fake TTS fallback** (deliberate): when TTS cannot run the bot
+  sends the locked `NARRATOR_REPLY_UNAVAILABLE` — audio quality is never
+  faked.
 
 ## Setup
 
@@ -95,6 +108,14 @@ Optional Scripter tuning:
 | `SCRIPTER_MODEL`        | `gemini-3.1-flash-lite` | Gemini text model for the narration paragraph. |
 | `SCRIPTER_GEMINI_TIMEOUT` | `60`                 | Seconds a Gemini script attempt may take before the key-free local writer is used instead. |
 
+Optional Narrator tuning:
+
+| Variable                 | Default                     | What it does |
+| ------------------------ | --------------------------- | ------------ |
+| `NARRATOR_MODEL`         | `gemini-3.1-flash-tts-preview` | Gemini TTS model for the voice note (direct API call, not an agent). |
+| `NARRATOR_VOICE`         | `Orus`                  | Prebuilt Gemini TTS voice (firm/low-register male). |
+| `NARRATOR_GEMINI_TIMEOUT`| `60`                        | Seconds a TTS synthesis may take before it is abandoned (graceful unavailable — there is no local TTS fallback). |
+
 Never commit `.env` — it is gitignored. Both secrets are scrubbed from every
 log record by a redaction filter (`src/logging_utils.py`); the httpx/httpcore
 loggers are silenced at the client so the token-bearing request URLs never leak.
@@ -112,7 +133,7 @@ Behaviour:
 | Text while idle (no interview running) | `Hi Mate` |
 | Photo with a human | `Hi Mate` then **`Human detected ✓`**, then the interview's **Q1** (the interview starts) |
 | Text while interviewing | Exactly **one** next question — the answer is stored in order first |
-| 7th answer | Behavioural profile covering **Habits / Quirks / Routines / Preferences** plus **`Suggested animal: X`**, then a **hybrid portrait photo** of you as that animal, then the **scripted narration** — one dramatic 60–90 word paragraph about you, arriving as the final message (order: profile text → hybrid photo → script text) |
+| 7th answer | Behavioural profile covering **Habits / Quirks / Routines / Preferences** plus **`Suggested animal: X`**, then a **hybrid portrait photo** of you as that animal, then the **scripted narration** — one dramatic 60–90 word paragraph about you — and finally a **voice note** of the narrator reading that paragraph (order: profile text → hybrid photo → script text → voice note) |
 | Text after the interview | Re-sends the stored profile + suggested animal |
 | `/start` or `/restart` | Wipes the chat's Bouncer session **and** Interviewer state, purges the stored portrait + Converter session, then invites a fresh photo |
 | Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` then **`Non-human detected`** (rejected + Bouncer session, Interviewer state, stored portrait and Converter session all reset) |
@@ -148,7 +169,22 @@ final text message. Any Gemini failure/timeout/blocked-key/off-shape output
 falls back to the deterministic `LocalScriptWriter`; if nothing can produce a
 valid paragraph the chat gets `SCRIPTER_REPLY_UNAVAILABLE` and nothing is
 stored. Like the Converter, each call starts from a fresh ADK session and
-reaps it afterwards. Phase 6 (Narrator/TTS) will read the stored `script`.
+reaps it afterwards.
+
+**The Narrator stage.** After the script text is sent, the gateway runs the
+Narrator for that chat: `synthesize` reads the stored `script` from the shared
+state and makes a **direct** `gemini-3.1-flash-tts-preview` call
+(`response_modalities=["AUDIO"]`, single-speaker prebuilt voice, persona
+instruction for a deep posh-British wildlife presenter) — explicitly no ADK
+agent, no reasoning step. The audio is staged through temp files (converted to
+OGG/Opus via ffmpeg when the API returns another format, with the output
+format forced), sent with `send_voice`, and the temp files are unlinked in a
+`finally` on success and error. A missing script, API error, timeout, or
+missing-ffmpeg-when-needed logs loudly and the chat receives the locked
+`NARRATOR_REPLY_UNAVAILABLE` ("Hang on — the narrator lost his voice. Give
+that another go?"); a *send* failure logs `event=narrator_send_failed` but no
+unavailable reply (the script and voice may have reached the chat). There is
+**no local/fake TTS fallback** — audio quality is never faked.
 
 Stop it with `Ctrl-C` (SIGINT) or SIGTERM — it shuts down gracefully.
 
@@ -162,14 +198,15 @@ Stop it with `Ctrl-C` (SIGINT) or SIGTERM — it shuts down gracefully.
 Live Gemini verification is **opt-in** (offline suite never requires a key):
 
 ```bash
-RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py tests/integration/test_live_converter.py tests/integration/test_live_scripter.py -v
+RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py tests/integration/test_live_converter.py tests/integration/test_live_scripter.py tests/integration/test_live_narrator.py -v
 ```
 
 It classifies committed fixtures (`tests/fixtures/person.jpg` — expect
 `human_present: true`; `tests/fixtures/non_human.jpg` — expect `false`),
-converts that portrait into a real `gemini-3.1-flash-image` hybrid, and writes
-a real `gemini-3.1-flash-lite` 60–90 word script from a seeded profile, using
-the key in `.env`.
+converts that portrait into a real `gemini-3.1-flash-image` hybrid, writes
+a real `gemini-3.1-flash-lite` 60–90 word script from a seeded profile, and
+synthesizes a real `gemini-3.1-flash-tts-preview` voice note from a seeded
+script, using the key in `.env`.
 
 ## Architecture
 
@@ -187,7 +224,11 @@ fresh + reaped sessions) with `src/portrait_store.py` (per-chat raw portrait)
 and `src/local_composite.py` (key-free photo-booth fallback) →
 `src/scripter.py` (ADK text agent on `gemini-3.1-flash-lite`, one 60–90 word
 documentary paragraph, `validate_script` shape gate, per-call fresh + reaped
-sessions) with `src/local_script.py` (key-free deterministic writer).
+sessions) with `src/local_script.py` (key-free deterministic writer) →
+`src/narrator.py` (**direct** `gemini-3.1-flash-tts-preview` call — not an
+agent — voice note via `send_voice`; temp-file lifecycle with
+`finally`-cleanup; ffmpeg OGG/Opus conversion seam when needed; no local TTS
+fallback).
 
 The Bouncer's verdict order: **Gemini (ADK agent) first**; on failure or
 timeout it falls back to the local YuNet detector so a photo always gets a

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entry point — The Telegram Documentaries, Phases 1–5.
+"""Entry point — The Telegram Documentaries, Phases 1–6.
 
 Long-polling loop that replies to every text message with the confirmation
 text while idle. Photo uploads pass through **The Bouncer** (an ADK LlmAgent on
@@ -20,6 +20,13 @@ Lite turns the profile into one 60–90 word British-wildlife-documentary
 paragraph, sends it to the chat, and stores the raw string on the shared state
 for the Phase 6 Narrator. While the Gemini key is blocked, the deterministic
 key-free ``LocalScriptWriter`` produces the paragraph instead.
+
+Finally **The Narrator** (Phase 6) fires: a **direct** Gemini TTS call (no
+agent) turns the stored script into a Telegram voice note in a deep, posh
+British wildlife-documentary voice, delivered via ``sendVoice`` (chat order:
+profile text → hybrid photo → script text → voice note). There is no local TTS
+fallback: any failure logs loudly and the gateway sends the locked
+``NARRATOR_REPLY_UNAVAILABLE`` copy rather than fake audio.
 
 When Gemini cannot be reached (missing/blocked API key, network failure,
 timeout) the Bouncer falls back to a key-free OpenCV face detector, so photo
@@ -48,6 +55,7 @@ from src.interviewer import Interviewer
 from src.local_script import LocalScriptWriter
 from src.local_vision import LocalVisionClassifier
 from src.logging_utils import configure_logging
+from src.narrator import Narrator
 from src.portrait_store import PortraitStore
 from src.scripter import Scripter
 from src.telegram_client import TelegramClient
@@ -153,6 +161,20 @@ def main() -> int:
     if not settings.gemini_api_key:
         logger.warning("event=scripter_local_only reason=missing_gemini_api_key")
 
+    # The Narrator (Phase 6) is a DIRECT Gemini TTS call — no agent, and no
+    # local/key-free fallback (locked decision). It reads the script the
+    # Scripter stored on the SAME shared state driver. Model/voice/timeout are
+    # resolved from NARRATOR_MODEL / NARRATOR_VOICE / NARRATOR_GEMINI_TIMEOUT.
+    narrator = Narrator(api_key=settings.gemini_api_key, store=interview_store)
+    if settings.gemini_api_key:
+        logger.info(
+            "event=narrator_ready model=%s voice=%s", narrator.model, narrator.voice
+        )
+    else:
+        # No local/key-free TTS fallback exists, so a keyless Narrator can never
+        # run: logging "ready" here would be misleading. Announce the gap loudly.
+        logger.warning("event=narrator_unavailable reason=missing_gemini_api_key")
+
     client = TelegramClient(token=settings.telegram_bot_token)
     gateway = Gateway(
         client,
@@ -161,6 +183,7 @@ def main() -> int:
         converter=converter,
         portraits=portraits,
         scripter=scripter,
+        narrator=narrator,
     )
     try:
         gateway.run(stop_event)

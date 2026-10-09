@@ -26,8 +26,25 @@ No webhook mode, no database, no cache layer, no extra services.
 - The flow is an explicit **state machine** with named phases (e.g. awaiting
   photo → interviewing → converting → scripting → narrating → done). Illegal
   transitions are rejected, not guessed at.
-- **The Narrator is not an agent.** The script is routed directly to Gemini TTS
-  and delivered as audio — no LLM reasoning step.
+- **The Narrator is not an agent.** The script is routed **directly** to Gemini
+  TTS and delivered as audio — no LLM reasoning step, no ADK `LlmAgent`, no
+  per-chat sessions. `src/narrator.py` calls
+  `client.models.generate_content(model="gemini-3.1-flash-tts-preview", ...)`
+  with `response_modalities=["AUDIO"]` and a single-speaker
+  `SpeechConfig(voice_config=VoiceConfig(prebuilt_voice_config=PrebuiltVoiceConfig(voice_name=...)))`;
+  a persona instruction (deep male, posh British, wildlife-documentary
+  presenter) is embedded in the request text alongside `state.script`
+  (NARRATOR_MODEL/NARRATOR_VOICE/NARRATOR_GEMINI_TIMEOUT overridable, bounded
+  daemon-thread + Event timeout). Audio is staged through temp files with
+  unpreventable `finally`-cleanup on success and error; a non-voice-note
+  format is converted to OGG/Opus via an ffmpeg seam (`-f ogg` forced before
+  the output path; missing ffmpeg when conversion is needed → loud
+  `NarratorError`). **Deliberately no local/fake TTS fallback**: any failure
+  degrades to the locked `NARRATOR_REPLY_UNAVAILABLE` — audio quality is never
+  faked. Delivery via `send_voice`; a send failure logs
+  `event=narrator_send_failed` loudly with no unavailable reply (the note may
+  have been delivered). The Narrator adds no state fields — audio is
+  transient, temp media purged.
 - **The Converter returns the image directly to Telegram** with no intermediate
   text hop: on completion the gateway sends the stored profile text, then makes
   **one multimodal ADK call** (`src/converter.py`) — the raw portrait
@@ -60,12 +77,13 @@ No webhook mode, no database, no cache layer, no extra services.
   state untouched, loop survives.
 - **Script delivery order:** after the profile text and the Converter's hybrid
   photo have been sent for a chat, the gateway runs the Scripter; the validated
-  paragraph is the third and final message (**profile text → hybrid photo →
-  script text**). The Scripter persists the raw string on the shared driver
-  (store first, then the gateway sends the same paragraph); a *delivery*
-  failure logs `event=script_send_failed` loudly — the stored script stays for
-  Phase 6 and no misleading apology is sent. Sessions are per-call fresh and
-  reaped (same rule as the Converter).
+  paragraph is the third message, and the Narrator's voice note the fourth and
+  final (**profile text → hybrid photo → script text → voice note**). The
+  Scripter persists the raw string on the shared driver (store first, then the
+  gateway sends the same paragraph); a *delivery* failure logs
+  `event=script_send_failed` loudly — the stored script stays for the Narrator
+  and no misleading apology is sent. Sessions are per-call fresh and reaped
+  (same rule as the Converter).
 
 ## Contracts at boundaries
 

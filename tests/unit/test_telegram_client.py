@@ -384,3 +384,88 @@ def test_send_photo_network_error_raises_redacted(caplog):
 
     assert TOKEN not in str(excinfo.value)
     assert TOKEN not in caplog.text
+
+
+# --- sendVoice (Phase 6 — The Narrator) -----------------------------------------
+
+
+def test_send_voice_posts_multipart_with_chat_id_and_audio_bytes():
+    captured = {}
+
+    def handler(request):
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["content_type"] = request.headers.get("content-type", "")
+        captured["body"] = request.content
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    voice_bytes = b"OggS\x00\x02opus-narration-bytes"
+    _client(handler).send_voice(4242, voice_bytes)
+
+    assert captured["method"] == "POST"
+    assert captured["path"] == f"/bot{TOKEN}/sendVoice"
+    assert captured["content_type"].startswith("multipart/form-data")
+    body = captured["body"]
+    assert b'name="chat_id"' in body
+    assert b"4242" in body
+    assert b'name="voice"' in body
+    assert b'filename="narration.ogg"' in body
+    assert b"audio/ogg" in body
+    assert voice_bytes in body
+
+
+def test_send_voice_honours_custom_filename_and_mime_type():
+    captured = {}
+
+    def handler(request):
+        captured["body"] = request.content
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    _client(handler).send_voice(7, b"mp3-bytes", filename="note.mp3", mime_type="audio/mpeg")
+
+    body = captured["body"]
+    assert b'filename="note.mp3"' in body
+    assert b"audio/mpeg" in body
+
+
+def test_send_voice_ok_false_raises_with_description():
+    def handler(request):
+        return httpx.Response(200, json={"ok": False, "description": "Bad Request: VOICE_MESSAGES_FORBIDDEN"})
+
+    with pytest.raises(TelegramAPIError) as excinfo:
+        _client(handler).send_voice(4242, b"bytes")
+
+    assert "VOICE_MESSAGES_FORBIDDEN" in str(excinfo.value)
+    assert TOKEN not in str(excinfo.value)
+
+
+def test_send_voice_http_error_raises_redacted(caplog):
+    def handler(request):
+        return httpx.Response(413, text="Request Entity Too Large")
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(TelegramAPIError) as excinfo:
+        _client(handler).send_voice(4242, b"bytes")
+
+    assert TOKEN not in str(excinfo.value)
+    assert TOKEN not in caplog.text
+
+
+def test_send_voice_malformed_response_raises_redacted():
+    def handler(request):
+        return httpx.Response(200, json={"ok": "not-a-bool"})
+
+    with pytest.raises(TelegramAPIError) as excinfo:
+        _client(handler).send_voice(4242, b"bytes")
+
+    assert TOKEN not in str(excinfo.value)
+
+
+def test_send_voice_network_error_raises_redacted(caplog):
+    def handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with caplog.at_level(logging.DEBUG), pytest.raises(TelegramAPIError) as excinfo:
+        _client(handler).send_voice(4242, b"bytes")
+
+    assert TOKEN not in str(excinfo.value)
+    assert TOKEN not in caplog.text

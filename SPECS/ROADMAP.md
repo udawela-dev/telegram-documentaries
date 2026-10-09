@@ -96,9 +96,19 @@ grounded in the dossier rather than generic filler.
 
 ### 6. Narrator — TTS delivery
 
-Route the script directly to `gemini-3.1-flash-tts-preview`, render to a
-Telegram-compatible audio format (OGG/MP3), and send it as a voice note. **Not an
-agent** — no reasoning step.
+**Implemented** (`feature/2026-10-09-narrator`): the stored 60–90 word script
+is routed **directly** — not as an agent — to `gemini-3.1-flash-tts-preview`
+(`response_modalities=["AUDIO"]`, single-speaker prebuilt voice + persona
+instruction, `src/narrator.py`), converted to Telegram-compatible OGG/Opus
+when needed (ffmpeg seam, output format forced), and sent as a **voice note**
+via `send_voice` — the fourth and final message (profile → photo → script →
+voice). Audio is staged through temp files with `finally`-cleanup on success
+and error; failures degrade to the locked `NARRATOR_REPLY_UNAVAILABLE`.
+Offline suite green (403 passed, 5 skipped — the skips are guarded live-Gemini
+tests). **Key-blocked note:** with `GEMINI_API_KEY` 403-blocked the real
+TTS cannot be exercised live; there is deliberately **no local/fake TTS
+fallback**, so the real voice-note path is proven by the guarded live test the
+moment a healthy key exists.
 
 **Acceptance:** the chat receives a playable audio note of the script.
 **Rubric:** voice delivery completes the documentary.

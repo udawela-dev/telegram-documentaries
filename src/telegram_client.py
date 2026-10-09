@@ -46,6 +46,15 @@ class SendPhotoResponse(BaseModel):
     description: str | None = None
 
 
+class SendVoiceResponse(BaseModel):
+    """Minimal validated shape of a sendVoice response (boundary check)."""
+
+    model_config = ConfigDict(extra="allow", strict=True)
+
+    ok: bool
+    description: str | None = None
+
+
 class TelegramClient:
     """Thin, typed wrapper around the Telegram Bot API over raw HTTP."""
 
@@ -136,6 +145,37 @@ class TelegramClient:
         if not response.ok:
             detail = f": {response.description}" if response.description else ""
             raise TelegramAPIError(f"sendPhoto returned ok=false{detail}")
+
+    @log_call()
+    def send_voice(
+        self,
+        chat_id: int,
+        voice_bytes: bytes,
+        *,
+        filename: str = "narration.ogg",
+        mime_type: str = "audio/ogg",
+    ) -> None:
+        """Send audio as a voice note via multipart ``sendVoice``.
+
+        Mirrors :meth:`send_photo`: the same redacting ``_request`` path, so any
+        failure becomes a token-free ``TelegramAPIError``. The response is
+        validated: ``ok=false`` (or a malformed body) raises.
+        """
+        payload = self._request(
+            "POST",
+            "/sendVoice",
+            data={"chat_id": chat_id},
+            files={"voice": (filename, voice_bytes, mime_type)},
+        )
+        try:
+            response = SendVoiceResponse.model_validate(payload)
+        except ValidationError as exc:
+            raise TelegramAPIError(
+                f"malformed sendVoice response: {exc.errors()[0]['msg']}"
+            ) from None
+        if not response.ok:
+            detail = f": {response.description}" if response.description else ""
+            raise TelegramAPIError(f"sendVoice returned ok=false{detail}")
 
     @log_call()
     def get_file(self, file_id: str) -> TelegramFile:
