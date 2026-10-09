@@ -3,7 +3,7 @@
 Send a portrait to a Telegram bot and receive a narrated, comedy-wildlife
 documentary about yourself.
 
-**Current state: Phases 1 + 2 + 3.**
+**Current state: Phases 1 + 2 + 3 + 4.**
 
 - **Phase 1 — the gateway.** A long-polling loop (`src/gateway.py`) that
   replies to text messages with `"Hi Mate"`.
@@ -19,6 +19,17 @@ documentary about yourself.
   deterministic and local, so the interview works **key-free**; an ADK
   `LlmAgent` on **Gemini 3.1 Flash Lite** is wired as the backbone (decision
   2026-10-08).
+- **Phase 4 — The Converter.** The portrait artist (`src/converter.py`): on
+  the 7th answer the approved photo + the interview dossier go into **one
+  multimodal call** on an ADK `LlmAgent` — **Gemini 3.1 Flash Image**
+  (`response_modalities=["IMAGE"]`, no intermediate text hop) — and the hybrid
+  animal portrait comes straight back to the chat via `send_photo`. Key-free
+  resilience (`src/local_composite.py`): whenever Gemini is unreachable /
+  timed out / the key is blocked, a deterministic OpenCV photo-booth composite
+  is produced instead, so the pipeline always emits a real image today. The
+  raw portrait is retained per chat (`src/portrait_store.py`) and purged on
+  `/start`, `/restart`, and rejected photos (which also reset the Converter's
+  ADK session).
 
 ## Setup
 
@@ -58,6 +69,13 @@ Optional Interviewer tuning:
 | -------------------- | ------- | ------------ |
 | `INTERVIEWER_MODEL`  | `gemini-3.1-flash-lite` | Gemini model for the ADK interview backbone (question selection and the profile/animal builder are local and key-free). |
 
+Optional Converter tuning:
+
+| Variable                  | Default                | What it does |
+| ------------------------- | ---------------------- | ------------ |
+| `CONVERTER_MODEL`         | `gemini-3.1-flash-image` | Gemini image-generation model for the hybrid portrait. |
+| `CONVERTER_GEMINI_TIMEOUT`| `60`                   | Seconds a Gemini image attempt may take before the local composite is used instead. |
+
 Never commit `.env` — it is gitignored. Both secrets are scrubbed from every
 log record by a redaction filter (`src/logging_utils.py`); the httpx/httpcore
 loggers are silenced at the client so the token-bearing request URLs never leak.
@@ -75,10 +93,10 @@ Behaviour:
 | Text while idle (no interview running) | `Hi Mate` |
 | Photo with a human | `Hi Mate` then **`Human detected ✓`**, then the interview's **Q1** (the interview starts) |
 | Text while interviewing | Exactly **one** next question — the answer is stored in order first |
-| 7th answer | Behavioural profile covering **Habits / Quirks / Routines / Preferences** plus **`Suggested animal: X`** |
+| 7th answer | Behavioural profile covering **Habits / Quirks / Routines / Preferences** plus **`Suggested animal: X`**, then a **hybrid portrait photo** of you as that animal arrives automatically |
 | Text after the interview | Re-sends the stored profile + suggested animal |
-| `/start` or `/restart` | Wipes the chat's Bouncer session **and** Interviewer state, then invites a fresh photo |
-| Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` then **`Non-human detected`** (rejected + Bouncer session and Interviewer state reset) |
+| `/start` or `/restart` | Wipes the chat's Bouncer session **and** Interviewer state, purges the stored portrait + Converter session, then invites a fresh photo |
+| Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` then **`Non-human detected`** (rejected + Bouncer session, Interviewer state, stored portrait and Converter session all reset) |
 | Photo when Gemini is unreachable | **Local fallback verdict**: face detected → human verdict; no face → non-human verdict. (Only if the local detector fails too does the graceful "Hang on…" reply appear.) |
 
 **The Interviewer state machine.** Interview progress lives on one shared
@@ -89,6 +107,17 @@ and two chats never see each other's state. Questions and the profile/animal
 builder are a curated, deterministic local bank (`src/interviewer.py`), so the
 interview works **key-free**; an ADK `LlmAgent` on `gemini-3.1-flash-lite` is
 wired as the backbone per the 2026-10-08 decision.
+
+**The Converter pipeline.** On completion the gateway sends the stored profile
+text, then hands the saved portrait + profile to `Converter.hybridize`: one
+ADK multimodal call (`portrait` bytes + instruction in a single `Content`,
+`response_modalities=["IMAGE"]`), the generated image bytes are sent straight
+back with `send_photo`. Every conversion starts from a **fresh, per-call ADK
+session** (delete-then-create) and reaps it afterwards — no history or image
+bytes linger in memory. If Gemini fails, times out (`CONVERTER_GEMINI_TIMEOUT`)
+or the key is blocked, `LocalHybridComposer` produces a deterministic
+photo-booth composite instead; with neither available the gateway replies
+gracefully (`CONVERTER_REPLY_UNAVAILABLE`) and the loop survives.
 
 Stop it with `Ctrl-C` (SIGINT) or SIGTERM — it shuts down gracefully.
 
@@ -102,23 +131,28 @@ Stop it with `Ctrl-C` (SIGINT) or SIGTERM — it shuts down gracefully.
 Live Gemini verification is **opt-in** (offline suite never requires a key):
 
 ```bash
-RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py -v
+RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py tests/integration/test_live_converter.py -v
 ```
 
 It classifies committed fixtures (`tests/fixtures/person.jpg` — expect
-`human_present: true`; `tests/fixtures/non_human.jpg` — expect `false`) using
-the key in `.env`.
+`human_present: true`; `tests/fixtures/non_human.jpg` — expect `false`) and
+converts that portrait into a real `gemini-3.1-flash-image` hybrid, using the
+key in `.env`.
 
 ## Architecture
 
 `main.py` (entry point) → `src/config.py` (`.env` → validated `Settings`) →
 `src/telegram_client.py` (raw-HTTP httpx client, incl. `getFile` + file
-download for photos) → `src/bouncer.py` (ADK agent + per-chat in-memory
-sessions, with a hard 60s Gemini timeout) + `src/local_vision.py` (key-free
-YuNet face detector, bundled model in `src/data/`) → `src/gateway.py`
-(polling loop + dispatcher + photo gate + interview routing) →
-`src/interviewer.py` (ADK backbone + deterministic 7-question bank + animal
-matcher) backed by `src/interview_state.py` (shared per-chat state driver).
+download for photos and `send_photo`) → `src/bouncer.py` (ADK agent + per-chat
+in-memory sessions, with a hard 60s Gemini timeout) + `src/local_vision.py`
+(key-free YuNet face detector, bundled model in `src/data/`, shared
+`decode_image_bytes` boundary) → `src/gateway.py` (polling loop + dispatcher +
+photo gate + interview routing + conversion) → `src/interviewer.py` (ADK
+backbone + deterministic 7-question bank + animal matcher) backed by
+`src/interview_state.py` (shared per-chat state driver) → `src/converter.py`
+(ADK image agent on `gemini-3.1-flash-image`, one multimodal call, per-call
+fresh + reaped sessions) with `src/portrait_store.py` (per-chat raw portrait)
+and `src/local_composite.py` (key-free photo-booth fallback).
 
 The Bouncer's verdict order: **Gemini (ADK agent) first**; on failure or
 timeout it falls back to the local YuNet detector so a photo always gets a

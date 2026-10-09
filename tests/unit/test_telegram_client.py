@@ -311,3 +311,76 @@ def test_download_file_network_error_raises_redacted(caplog):
 def test_download_file_rejects_empty_path():
     with pytest.raises(TelegramAPIError):
         _client(lambda r: httpx.Response(200, content=b"x")).download_file("")
+
+
+# --- sendPhoto (Phase 4 — The Converter) ----------------------------------------
+
+
+def test_send_photo_posts_multipart_with_chat_id_and_image_bytes():
+    captured = {}
+
+    def handler(request):
+        captured["method"] = request.method
+        captured["path"] = request.url.path
+        captured["content_type"] = request.headers.get("content-type", "")
+        captured["body"] = request.content
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+
+    image_bytes = b"\xff\xd8\xff\xe0hybrid-jpeg-bytes"
+    _client(handler).send_photo(4242, image_bytes, filename="hybrid.jpg", mime_type="image/jpeg")
+
+    assert captured["method"] == "POST"
+    assert captured["path"] == f"/bot{TOKEN}/sendPhoto"
+    assert captured["content_type"].startswith("multipart/form-data")
+    body = captured["body"]
+    assert b'name="chat_id"' in body
+    assert b"4242" in body
+    assert b'name="photo"' in body
+    assert b'filename="hybrid.jpg"' in body
+    assert b"image/jpeg" in body
+    assert image_bytes in body
+
+
+def test_send_photo_ok_false_raises_with_description():
+    def handler(request):
+        return httpx.Response(200, json={"ok": False, "description": "Bad Request: PHOTO_INVALID_DIMENSIONS"})
+
+    with pytest.raises(TelegramAPIError) as excinfo:
+        _client(handler).send_photo(4242, b"bytes")
+
+    assert "PHOTO_INVALID_DIMENSIONS" in str(excinfo.value)
+    assert TOKEN not in str(excinfo.value)
+
+
+def test_send_photo_http_error_raises_redacted(caplog):
+    def handler(request):
+        return httpx.Response(413, text="Request Entity Too Large")
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(TelegramAPIError) as excinfo:
+            _client(handler).send_photo(4242, b"bytes")
+
+    assert TOKEN not in str(excinfo.value)
+    assert TOKEN not in caplog.text
+
+
+def test_send_photo_malformed_response_raises_redacted():
+    def handler(request):
+        return httpx.Response(200, json={"ok": "not-a-bool"})
+
+    with pytest.raises(TelegramAPIError) as excinfo:
+        _client(handler).send_photo(4242, b"bytes")
+
+    assert TOKEN not in str(excinfo.value)
+
+
+def test_send_photo_network_error_raises_redacted(caplog):
+    def handler(request):
+        raise httpx.ConnectError("connection refused", request=request)
+
+    with caplog.at_level(logging.DEBUG):
+        with pytest.raises(TelegramAPIError) as excinfo:
+            _client(handler).send_photo(4242, b"bytes")
+
+    assert TOKEN not in str(excinfo.value)
+    assert TOKEN not in caplog.text

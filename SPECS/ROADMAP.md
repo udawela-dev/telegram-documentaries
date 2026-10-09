@@ -49,6 +49,17 @@ per `chat_id`; two concurrent users never see each other's state.
 
 ### 4. Converter — hybrid portrait
 
+**Implemented** (`feature/2026-10-08-converter`): one multimodal ADK call on
+`gemini-3.1-flash-image` (`response_modalities=["IMAGE"]`) fuses the raw
+portrait (`src/portrait_store.py`) with the interview dossier into a hybrid
+animal portrait, returned **directly to Telegram with no intermediate text
+hop** (`src/converter.py` + `send_photo`). ADK sessions are strictly per-call
+(fresh delete-then-create + `finally` reap). Offline suite green (272 passed,
+3 skipped — the 3 are guarded live-Gemini tests). **Key-blocked note:** the
+local photo-booth composite (`src/local_composite.py`) is the live fallback
+while `GEMINI_API_KEY` stays 403-blocked; the real Flash Image hybrid is
+exercised by the guarded live test the moment a healthy key exists.
+
 Gemini 3.1 Flash Image fuses the original photo with the interview dossier into
 a hybrid animal portrait, returned **directly to Telegram with no intermediate
 text hop**.

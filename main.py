@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entry point — The Telegram Documentaries, Phases 1–3.
+"""Entry point — The Telegram Documentaries, Phases 1–4.
 
 Long-polling loop that replies to every text message with the confirmation
 text while idle. Photo uploads pass through **The Bouncer** (an ADK LlmAgent on
@@ -7,6 +7,13 @@ Gemini 3.1 Flash Lite): approved photos continue into **The Interviewer**, a
 stateful seven-question documentary interview whose answers build a behavioural
 profile plus a suggested animal; non-human photos get a cheeky rejection and
 reset the chat's ephemeral state.
+
+On completion **The Converter** (Phase 4) fires: an ADK ``LlmAgent`` on
+Gemini 3.1 Flash Image builds a hybrid animal portrait from the retained
+photo + profile and sends it straight to the chat. While the Gemini key is
+blocked, a deterministic OpenCV photo-booth composer produces the image
+instead; the local composer is wired as the resilience fallback exactly like
+the Bouncer's local face detector.
 
 When Gemini cannot be reached (missing/blocked API key, network failure,
 timeout) the Bouncer falls back to a key-free OpenCV face detector, so photo
@@ -28,11 +35,13 @@ import threading
 
 from src.bouncer import Bouncer
 from src.config import ConfigError, load_settings
+from src.converter import Converter
 from src.gateway import Gateway
 from src.interview_state import InterviewStateStore
 from src.interviewer import Interviewer
 from src.local_vision import LocalVisionClassifier
 from src.logging_utils import configure_logging
+from src.portrait_store import PortraitStore
 from src.telegram_client import TelegramClient
 
 
@@ -87,8 +96,47 @@ def main() -> int:
     interview_store = InterviewStateStore()
     interviewer = Interviewer(api_key=settings.gemini_api_key, store=interview_store)
 
+    # The Converter (Phase 4) owns the hybrid portrait: an ADK image agent on
+    # gemini-3.1-flash-image, plus the key-free local photo-booth fallback while
+    # the Gemini key is blocked. The portrait store keeps the approved photo's
+    # raw bytes per chat_id until the interview completes (or a reset purges it).
+    portraits = PortraitStore()
+    local_composer = None
+    try:
+        # Imported lazily so a missing cv2 degrades to "no local fallback"
+        # instead of stopping the whole bot at import time.
+        from src.local_composite import LocalHybridComposer
+
+        local_composer = LocalHybridComposer()
+    except Exception:
+        logger.exception("event=converter_local_composer_unavailable")
+
+    converter = None
+    if settings.gemini_api_key or local_composer is not None:
+        converter = Converter(
+            api_key=settings.gemini_api_key,
+            local_composer=local_composer,
+        )
+        logger.info(
+            "event=converter_ready model=%s local_fallback=%s",
+            converter.model,
+            local_composer is not None,
+        )
+        if not settings.gemini_api_key:
+            logger.warning("event=converter_local_only reason=missing_gemini_api_key")
+    else:
+        logger.warning(
+            "event=converter_unavailable reason=no_gemini_key_and_no_local_composer"
+        )
+
     client = TelegramClient(token=settings.telegram_bot_token)
-    gateway = Gateway(client, bouncer=bouncer, interviewer=interviewer)
+    gateway = Gateway(
+        client,
+        bouncer=bouncer,
+        interviewer=interviewer,
+        converter=converter,
+        portraits=portraits,
+    )
     try:
         gateway.run(stop_event)
     finally:

@@ -1,4 +1,4 @@
-"""Phase 1+2+3 gateway: long-polling loop + dispatcher (Bouncer gate, Interviewer flow).
+"""Phase 1+2+3+4 gateway: long-polling loop + dispatcher (Bouncer → Interviewer → Converter).
 
 Behaviour contract:
 * every TEXT message gets the confirmation reply — no state, no branching —
@@ -8,13 +8,20 @@ Behaviour contract:
   the one next question, ``complete`` → resend the stored profile summary;
 * every PHOTO message passes through The Bouncer gate (Phase 2): approved →
   the confirmation reply is sent unchanged, then a second message announces
-  the verdict ("Human detected ✓"), then the interview starts (Q1); rejected →
-  cheeky rejection, then a second message ("Non-human detected"), and both the
-  chat's Bouncer session and interview state are reset; download/classify
-  failures → graceful reply, no reset, loop survives;
+  the verdict ("Human detected ✓"), the approved portrait is saved for the
+  Converter (Phase 4), then the interview starts (Q1); rejected → cheeky
+  rejection, then a second message ("Non-human detected"), and the chat's
+  Bouncer session, interview state and stored portrait are purged;
+  download/classify failures → graceful reply, no reset, loop survives;
+* on the 7th answer (Phase 4) the profile text is sent as before, then the
+  Converter fires and the hybrid image is sent via ``send_photo`` to the same
+  chat; missing portrait/profile or any converter/photo failure → loud log +
+  graceful ``CONVERTER_REPLY_UNAVAILABLE`` reply, loop survives. With no
+  converter (or no portrait store) wired, completion is exactly Phase 3;
 * ``/start`` and ``/restart`` (with an interviewer wired) reset both stages and
-  send a confirmation reply; without an interviewer every text, commands
-  included, gets the confirmation reply (Phase-1 compatibility);
+  purge the stored portrait, then send a confirmation reply; without an
+  interviewer every text, commands included, gets the confirmation reply
+  (Phase-1 compatibility);
 * ``offset`` advances after each update is processed OR attempted, so no
   update is ever reprocessed;
 * a failing poll or a failing reply never kills the loop (fail loudly,
@@ -36,6 +43,7 @@ from src.bouncer import (
     HUMAN_VERDICT_REPLY,
     NON_HUMAN_VERDICT_REPLY,
 )
+from src.converter import CONVERTER_REPLY_UNAVAILABLE
 from src.interview_state import InterviewPhase
 from src.interviewer import INTERVIEWER_REPLY_RESET, INTERVIEWER_REPLY_UNAVAILABLE
 from src.telegram_models import Message, TelegramAPIError, Update
@@ -52,6 +60,8 @@ class Gateway:
         *,
         bouncer=None,
         interviewer=None,
+        converter=None,
+        portraits=None,
         reply_text: str = REPLY_TEXT,
         poll_timeout: int = 30,
         backoff_seconds: float = 0.5,
@@ -60,6 +70,10 @@ class Gateway:
         self._bouncer = bouncer
         # When None, text always says "Hi Mate" (Phase-1 backward compatibility).
         self._interviewer = interviewer
+        # Phase 4: the portrait store + converter. When either is absent the
+        # interview-completion path is exactly Phase 3 (no extra media/replies).
+        self._converter = converter
+        self._portraits = portraits
         self._reply_text = reply_text
         self._poll_timeout = poll_timeout
         self._backoff_seconds = backoff_seconds
@@ -203,7 +217,86 @@ class Gateway:
             return True
         for outbound in reply.messages:
             self._client.send_message(chat_id, outbound)
+        if reply.completed:
+            # Profile text has been sent; now the hybrid image (Phase 4). Any
+            # converter failure degrades gracefully and never breaks the loop.
+            self._handle_conversion(chat_id, reply.profile, update_id)
         return True
+
+    def _handle_conversion(self, chat_id: int, profile, update_id: int) -> None:
+        """Send the hybrid image after an interview completes (Phase 4).
+
+        Inactive (exactly Phase 3) unless BOTH a converter and a portrait store
+        are wired. Missing portrait/profile → loud log + graceful reply;
+        converter or ``send_photo`` failure → loud log + graceful reply. State
+        is never touched and the polling loop always survives.
+        """
+        if self._converter is None or self._portraits is None:
+            return  # Phase-3 regression: no converter, no extra replies/events
+
+        if profile is None:
+            logger.error(
+                "event=converter_profile_missing chat_id=%s update_id=%d",
+                chat_id,
+                update_id,
+            )
+            self._client.send_message(chat_id, CONVERTER_REPLY_UNAVAILABLE)
+            return
+
+        try:
+            portrait = self._portraits.get(chat_id)
+        except Exception:
+            logger.exception(
+                "event=portrait_get_failed chat_id=%s update_id=%d",
+                chat_id,
+                update_id,
+            )
+            portrait = None
+
+        if not portrait:
+            logger.error(
+                "event=converter_portrait_missing chat_id=%s update_id=%d",
+                chat_id,
+                update_id,
+            )
+            self._client.send_message(chat_id, CONVERTER_REPLY_UNAVAILABLE)
+            return
+
+        logger.info(
+            "event=converter_started chat_id=%s update_id=%d bytes=%d",
+            chat_id,
+            update_id,
+            len(portrait),
+        )
+        try:
+            hybrid = self._converter.hybridize(chat_id, portrait, profile)
+        except Exception:
+            logger.exception(
+                "event=converter_failed chat_id=%s update_id=%d stage=hybridize",
+                chat_id,
+                update_id,
+            )
+            self._client.send_message(chat_id, CONVERTER_REPLY_UNAVAILABLE)
+            return
+
+        try:
+            self._client.send_photo(chat_id, hybrid, filename="hybrid.jpg")
+        except Exception:
+            logger.exception(
+                "event=converter_failed chat_id=%s update_id=%d stage=send_photo bytes=%d",
+                chat_id,
+                update_id,
+                len(hybrid),
+            )
+            self._client.send_message(chat_id, CONVERTER_REPLY_UNAVAILABLE)
+            return
+
+        logger.info(
+            "event=hybrid_sent chat_id=%s update_id=%d bytes=%d",
+            chat_id,
+            update_id,
+            len(hybrid),
+        )
 
     def _handle_reset_command(self, chat_id: int, update_id: int) -> bool:
         """``/start`` or ``/restart``: purge Bouncer session + Interviewer state.
@@ -221,9 +314,28 @@ class Gateway:
                 self._interviewer.reset(chat_id)
             except Exception:
                 logger.exception("event=interview_reset_failed chat_id=%s", chat_id)
+        # A reset purges the chat's temporary media + converter session too
+        # (TECH.md reset semantics).
+        self._purge_portrait(chat_id)
+        if self._converter is not None:
+            try:
+                self._converter.reset_chat(chat_id)
+            except Exception:
+                logger.exception(
+                    "event=converter_session_reset_failed chat_id=%s", chat_id
+                )
         self._client.send_message(chat_id, INTERVIEWER_REPLY_RESET)
         logger.info("event=reset_command chat_id=%s update_id=%d", chat_id, update_id)
         return True
+
+    def _purge_portrait(self, chat_id: int) -> None:
+        """Delete the chat's stored portrait, logging loudly on failure."""
+        if self._portraits is None:
+            return
+        try:
+            self._portraits.delete(chat_id)
+        except Exception:
+            logger.exception("event=portrait_delete_failed chat_id=%s", chat_id)
 
     def _handle_photo(self, message: Message, chat_id: int, update_id: int) -> bool:
         """Photo uploads → The Bouncer; an approved photo starts the interview.
@@ -279,6 +391,24 @@ class Gateway:
                 chat_id,
                 decision.reason,
             )
+            # Retain the approved portrait for the Converter. A store failure is
+            # user-invisible work: log loudly and continue the approval flow
+            # (the later completion then degrades to CONVERTER_REPLY_UNAVAILABLE).
+            if self._portraits is not None:
+                try:
+                    self._portraits.save(chat_id, image_bytes)
+                    logger.info(
+                        "event=portrait_saved chat_id=%s update_id=%d bytes=%d",
+                        chat_id,
+                        update_id,
+                        len(image_bytes),
+                    )
+                except Exception:
+                    logger.exception(
+                        "event=portrait_save_failed chat_id=%s update_id=%d",
+                        chat_id,
+                        update_id,
+                    )
             self._client.send_message(chat_id, self._reply_text)
             self._client.send_message(chat_id, HUMAN_VERDICT_REPLY)
             logger.info(
@@ -319,12 +449,21 @@ class Gateway:
             logger.exception(
                 "event=bouncer_session_reset_failed chat_id=%s", chat_id
             )
-        # A rejected photo purges the interview too (mirrors the Bouncer reset).
+        # A rejected photo purges the interview too (mirrors the Bouncer reset),
+        # plus the stored portrait and converter session.
         if self._interviewer is not None:
             try:
                 self._interviewer.reset(chat_id)
             except Exception:
                 logger.exception("event=interview_reset_failed chat_id=%s", chat_id)
+        self._purge_portrait(chat_id)
+        if self._converter is not None:
+            try:
+                self._converter.reset_chat(chat_id)
+            except Exception:
+                logger.exception(
+                    "event=converter_session_reset_failed chat_id=%s", chat_id
+                )
         return True
 
     def run(self, stop_event: threading.Event) -> None:

@@ -40,6 +40,20 @@ DEFAULT_SCORE_THRESHOLD = 0.3
 SCORE_THRESHOLD = float(os.getenv("BOUNCER_YUNET_THRESHOLD", str(DEFAULT_SCORE_THRESHOLD)))
 
 
+def decode_image_bytes(image_bytes: bytes) -> np.ndarray:
+    """Decode untrusted bytes into a BGR image; undecodable/empty → loud error.
+
+    Shared by the Bouncer's face detection and the Converter's local composer
+    so the codebase has exactly one decoding boundary for uploaded photos.
+    """
+    if not image_bytes:
+        raise ValueError("unable to decode empty image bytes as a picture")
+    image = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if image is None:
+        raise ValueError("unable to decode image bytes as a picture")
+    return image
+
+
 class LocalVisionClassifier:
     """Key-free human/non-human verdict via YuNet (in-process, no network)."""
 
@@ -59,20 +73,66 @@ class LocalVisionClassifier:
         """True iff at least one face is found. Raises on undecodable input."""
         if not self.available:
             raise RuntimeError("local vision unavailable: face model did not load")
-        image = self._cv2.imdecode(
-            np.frombuffer(image_bytes, dtype=np.uint8), self._cv2.IMREAD_COLOR
-        )
-        if image is None:
-            raise ValueError("unable to decode image bytes as a picture")
-        count = self._detect(image, upscale=1)
-        if count == 0:
+        image = decode_image_bytes(image_bytes)
+        faces = self._detect(image, upscale=1)
+        if faces is None or len(faces) == 0:
             # Small faces (distant / wide shots) are caught by a 2x plate.
-            count = self._detect(image, upscale=2)
+            faces = self._detect(image, upscale=2)
+        count = 0 if faces is None else int(len(faces))
         logger.info("event=local_vision_verdict faces=%d", count)
         return count > 0
 
-    def _detect(self, image: np.ndarray, *, upscale: int) -> int:
-        """Run YuNet once at native or upscaled resolution; return face count."""
+    @log_call(event="local_vision_largest_face_box")
+    def largest_face_box(self, image_bytes: bytes) -> tuple[int, int, int, int] | None:
+        """Largest detected face as ``(x, y, w, h)`` in ORIGINAL-image coords.
+
+        Reuses the same YuNet detector and threshold as ``human_present`` — a
+        native pass first, then the 2x rescue pass for small faces. Any box
+        found in the 2x image is scaled back to original coordinates. Returns
+        ``None`` when no face is detected; raises on undecodable input.
+        """
+        if not self.available:
+            raise RuntimeError("local vision unavailable: face model did not load")
+        return self.largest_face_box_from_image(decode_image_bytes(image_bytes))
+
+    @log_call(event="local_vision_largest_face_box")
+    def largest_face_box_from_image(self, image: np.ndarray) -> tuple[int, int, int, int] | None:
+        """Largest YuNet face box ``(x, y, w, h)`` in this image's coordinates.
+
+        Works on an already-decoded image (the Composer decodes once); a 2×
+        rescue pass catches small faces and its box is scaled back so the
+        coordinates always match the caller's image.
+        """
+        if not self.available:
+            raise RuntimeError("local vision unavailable: face model did not load")
+        faces = self._detect(image, upscale=1)
+        scale = 1
+        if faces is None or len(faces) == 0:
+            faces = self._detect(image, upscale=2)
+            scale = 2
+        if faces is None or len(faces) == 0:
+            logger.info("event=local_vision_no_face")
+            return None
+
+        # Each row: x, y, w, h, landmarks…, score. Largest by area wins.
+        largest = max(faces, key=lambda row: float(row[2]) * float(row[3]))
+        x, y, w, h = (float(largest[index]) for index in range(4))
+        if scale != 1:
+            x, y, w, h = x / scale, y / scale, w / scale, h / scale
+        box = (int(round(x)), int(round(y)), int(round(w)), int(round(h)))
+        logger.info(
+            "event=local_vision_face_box x=%d y=%d w=%d h=%d upscale=%d",
+            *box,
+            scale,
+        )
+        return box
+
+    def _detect(self, image: np.ndarray, *, upscale: int):
+        """Run YuNet once at native or upscaled resolution.
+
+        Returns the raw ``(N, 15)`` faces array (or ``None`` when nothing is
+        found) so callers can count faces or locate the largest box.
+        """
         if upscale != 1:
             image = self._cv2.resize(
                 image, (image.shape[1] * upscale, image.shape[0] * upscale)
@@ -85,4 +145,4 @@ class LocalVisionClassifier:
             score_threshold=SCORE_THRESHOLD,
         )
         _, faces = detector.detect(image)
-        return 0 if faces is None else int(len(faces))
+        return faces

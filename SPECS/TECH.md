@@ -29,7 +29,24 @@ No webhook mode, no database, no cache layer, no extra services.
 - **The Narrator is not an agent.** The script is routed directly to Gemini TTS
   and delivered as audio — no LLM reasoning step.
 - **The Converter returns the image directly to Telegram** with no intermediate
-  text hop.
+  text hop: on completion the gateway sends the stored profile text, then makes
+  **one multimodal ADK call** (`src/converter.py`) — the raw portrait
+  (`inline_data` blob) plus the profile-grounded instruction in a single
+  `Content`, `generate_content_config` requesting `response_modalities=["IMAGE"]`
+  — and the generated image is sent straight back with `send_photo`.
+- **The Converter's ADK sessions are strictly per-call.** Every `hybridize`
+  starts from a **fresh** session (delete-then-create) and **reaps** it in a
+  `finally` — a reused session would leak the previous portrait/prompt/image as
+  inline history and keep those bytes in memory forever. `/start`, `/restart`
+  and rejected photos also purge the chat's converter session via
+  `Converter.reset_chat` (idempotent, chat-scoped; failures are logged, never
+  fatal to the loop).
+- **Key-free resilience:** on any Gemini failure/timeout/blocked key the
+  Converter falls back to the deterministic OpenCV photo-booth composite
+  (`src/local_composite.py`, archetypes cat/wolf/goat/owl/otter, decoded via the
+  shared `decode_image_bytes` boundary in `src/local_vision.py`). With neither
+  available it raises a loud `ConverterError` and the gateway replies
+  `CONVERTER_REPLY_UNAVAILABLE` — never a silent fake image.
 
 ## Contracts at boundaries
 

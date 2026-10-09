@@ -37,6 +37,15 @@ class SendMessageResponse(BaseModel):
     description: str | None = None
 
 
+class SendPhotoResponse(BaseModel):
+    """Minimal validated shape of a sendPhoto response (boundary check)."""
+
+    model_config = ConfigDict(extra="allow", strict=True)
+
+    ok: bool
+    description: str | None = None
+
+
 class TelegramClient:
     """Thin, typed wrapper around the Telegram Bot API over raw HTTP."""
 
@@ -96,6 +105,37 @@ class TelegramClient:
         if not response.ok:
             detail = f": {response.description}" if response.description else ""
             raise TelegramAPIError(f"sendMessage returned ok=false{detail}")
+
+    @log_call()
+    def send_photo(
+        self,
+        chat_id: int,
+        image_bytes: bytes,
+        *,
+        filename: str = "hybrid.jpg",
+        mime_type: str = "image/jpeg",
+    ) -> None:
+        """Send an image as a photo via multipart ``sendPhoto``.
+
+        Uses the same redacting ``_request`` path as every other call, so any
+        failure becomes a token-free ``TelegramAPIError``. The response is
+        validated: ``ok=false`` (or a malformed body) raises.
+        """
+        payload = self._request(
+            "POST",
+            "/sendPhoto",
+            data={"chat_id": chat_id},
+            files={"photo": (filename, image_bytes, mime_type)},
+        )
+        try:
+            response = SendPhotoResponse.model_validate(payload)
+        except ValidationError as exc:
+            raise TelegramAPIError(
+                f"malformed sendPhoto response: {exc.errors()[0]['msg']}"
+            ) from None
+        if not response.ok:
+            detail = f": {response.description}" if response.description else ""
+            raise TelegramAPIError(f"sendPhoto returned ok=false{detail}")
 
     @log_call()
     def get_file(self, file_id: str) -> TelegramFile:
