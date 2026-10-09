@@ -45,6 +45,12 @@ No webhook mode, no database, no cache layer, no extra services.
   `event=narrator_send_failed` loudly with no unavailable reply (the note may
   have been delivered). The Narrator adds no state fields — audio is
   transient, temp media purged.
+- **The Bouncer's local fallback verdicts are labelled.** The vision gate's
+  primary judge is the ADK `LlmAgent` on Gemini (Phase 2, `src/bouncer.py`);
+  when Gemini is unreachable/missing a key the key-free **YuNet** face detector
+  (`src/local_vision.py`) supplies the verdict and `BouncerDecision.source`
+  becomes `"local"`. Local (YuNet) verdicts are labeled "(offline face check)"
+  in the chat; Gemini verdicts keep the standard copy.
 - **The Converter returns the image directly to Telegram** with no intermediate
   text hop: on completion the gateway sends the stored profile text, then makes
   **one multimodal ADK call** (`src/converter.py`) — the raw portrait

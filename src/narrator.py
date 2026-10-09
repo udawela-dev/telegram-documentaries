@@ -9,7 +9,12 @@ preview model through a single direct ``client.models.generate_content`` call
 (``response_modalities=["AUDIO"]`` + a single-speaker speech config). The
 returned audio is staged through a temp file, converted to OGG/Opus via the
 ffmpeg CLI when the model returns any other format, and handed back to the
-gateway for ``sendVoice``.
+gateway for ``sendVoice``. Gemini TTS normally returns **headerless LINEAR16
+PCM** (24 kHz mono s16le); the seam decides the source format from the response
+mime and declares that raw input format to ffmpeg explicitly, because ffmpeg
+cannot probe a headerless payload (``Invalid data found when processing
+input``). Any other (non-RIFF, non-PCM) payload is staged opaquely so ffmpeg
+probes its real container rather than force-decoding it as PCM.
 
 There is **no local/key-free TTS fallback** (locked user decision): any failure —
 no key, API error, timeout, malformed/empty response, or a needed ffmpeg that is
@@ -25,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -62,6 +68,16 @@ NARRATOR_PERSONA = (
 
 # MIME types our conversion seam treats as already sendVoice-compatible.
 _OGG_MIME_TYPES = frozenset({"audio/ogg", "audio/opus", "application/ogg"})
+
+# Known raw-audio config for Gemini's TTS preview models. When the model returns
+# no container header, the payload is headerless LINEAR16 PCM. Google's own TTS
+# sample code writes those bytes straight into a 24 kHz mono 16-bit WAV, which
+# pins the format: signed 16-bit little-endian, 1 channel, 24000 Hz. ffmpeg
+# cannot sniff headerless PCM, so the conversion seam must declare it explicitly
+# (otherwise it aborts with "Invalid data found when processing input").
+NARRATOR_SAMPLE_RATE_HZ = 24000
+NARRATOR_CHANNELS = 1
+NARRATOR_PCM_CODEC = "s16le"
 
 
 def resolve_narrator_model() -> str:
@@ -253,9 +269,12 @@ class Narrator:
     def _temp_path(prefix: str, registry: list[str], suffix: str = ".tmp") -> str:
         """Create a real temp file, register it for ``finally`` cleanup.
 
-        ``suffix`` matters for the conversion target: ffmpeg infers the output
-        container from the file extension, so a ``.tmp`` target is one reason the
-        real conversion path failed (B1). The target is created with ``.ogg``.
+        ``suffix`` matters on both ends of the conversion: ffmpeg infers the
+        output container from the target extension (the target is created with
+        ``.ogg``), and it uses the source extension as a probe hint (``.wav`` for
+        RIFF/WAVE, ``.pcm`` for the TTS model's headerless LINEAR16; see
+        :meth:`_source_format`). An opaque ``.tmp`` source was one reason the
+        real conversion path failed (B2).
         """
         fd, path = tempfile.mkstemp(
             prefix=f"{prefix}-", suffix=suffix, dir=tempfile.gettempdir()
@@ -280,12 +299,81 @@ class Narrator:
                 return False
         return True
 
-    def _convert_to_ogg(self, input_path: str, output_path: str) -> None:
+    @staticmethod
+    def _is_wav(audio: bytes) -> bool:
+        """True for a self-describing RIFF/WAVE payload ffmpeg can probe."""
+        return audio[:4] == b"RIFF" and audio[8:12] == b"WAVE"
+
+    @staticmethod
+    def _is_linear_pcm_mime(mime: str | None) -> bool:
+        """True when the response mime identifies headerless LINEAR16 PCM.
+
+        Gemini TTS advertises its raw payload as ``audio/L16``/``audio/LPCM`` or
+        with ``codec=pcm``. Only those need the explicit demuxer declaration; an
+        unknown/other format must be probed by ffmpeg instead of being
+        force-decoded as PCM (which would emit silent noise).
+        """
+        if not mime:
+            return False
+        normalized = mime.lower()
+        return "l16" in normalized or "lpcm" in normalized or "codec=pcm" in normalized
+
+    @staticmethod
+    def _pcm_sample_rate(mime: str | None) -> int:
+        """The ``rate=`` (Hz) a linear-PCM mime declares, else the 24 kHz default."""
+        if mime:
+            match = re.search(r"rate=(\d+)", mime.lower())
+            if match:
+                return int(match.group(1))
+        return NARRATOR_SAMPLE_RATE_HZ
+
+    @classmethod
+    def _source_format(
+        cls, audio: bytes, mime: str | None = None
+    ) -> tuple[str, list[str]]:
+        """Return ``(suffix, ffmpeg input args)`` for staging a TTS payload.
+
+        * A self-describing RIFF/WAVE payload → ``.wav`` suffix, no declaration
+          (ffmpeg probes it).
+        * Headerless LINEAR16 PCM — identified from the response *mime*
+          (``audio/L16``/``audio/LPCM``/``codec=pcm``), honouring any declared
+          ``rate=`` — → ``.pcm`` suffix plus an explicit ``s16le``/rate/mono
+          declaration, because ffmpeg cannot probe a headerless payload.
+        * Anything else (e.g. a future MP3/FLAC response) → opaque ``.tmp`` with
+          no declared format, so ffmpeg probes by content. If it cannot, the
+          conversion fails loudly rather than force-decoding the bytes as PCM.
+        """
+        if cls._is_wav(audio):
+            return ".wav", []
+        if cls._is_linear_pcm_mime(mime):
+            return (
+                ".pcm",
+                [
+                    "-f",
+                    NARRATOR_PCM_CODEC,
+                    "-ar",
+                    str(cls._pcm_sample_rate(mime)),
+                    "-ac",
+                    str(NARRATOR_CHANNELS),
+                ],
+            )
+        return ".tmp", []
+
+    def _convert_to_ogg(
+        self,
+        input_path: str,
+        output_path: str,
+        *,
+        input_args: list[str] | None = None,
+    ) -> None:
         """Convert an arbitrary audio temp file to OGG/Opus via the ffmpeg CLI.
 
-        Scriptable seam for offline tests. Missing ffmpeg when conversion is
-        needed raises :class:`NarratorError` — the gateway degrades to the
-        locked unavailable copy, and nothing is ever silently skipped.
+        ``input_args`` carries an explicit input demuxer/format declaration
+        (``-f s16le -ar 24000 -ac 1`` for headerless LINEAR16 PCM); when omitted
+        ffmpeg probes the container from the file body. Scriptable seam for
+        offline tests. Missing ffmpeg when conversion is needed raises
+        :class:`NarratorError` — the gateway degrades to the locked unavailable
+        copy, and nothing is ever silently skipped.
         """
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
@@ -298,6 +386,11 @@ class Narrator:
             "-y",
             "-loglevel",
             "error",
+        ]
+        # Declare the input format when the payload is headerless (raw PCM); a
+        # self-describing container passes no hint and ffmpeg probes it.
+        cmd += list(input_args or [])
+        cmd += [
             "-i",
             input_path,
             "-c:a",
@@ -314,7 +407,10 @@ class Narrator:
             "ogg",
             output_path,
         ]
-        logger.info("event=narrator_conversion_started")
+        logger.info(
+            "event=narrator_conversion_started input_declared=%s",
+            " ".join(input_args) if input_args else "auto",
+        )
         try:
             completed = subprocess.run(
                 cmd, capture_output=True, timeout=float(self.timeout), check=False
@@ -382,13 +478,17 @@ class Narrator:
                 )
 
             if self._needs_conversion(audio, mime):
-                source = self._temp_path("narrator-source", temp_paths)
+                # Decide the source suffix/demuxer from the response mime:
+                # ``.wav`` (self-describing), ``.pcm`` (declared LINEAR16), or an
+                # opaque ``.tmp`` that ffmpeg probes by content.
+                suffix, input_args = self._source_format(audio, mime)
+                source = self._temp_path("narrator-source", temp_paths, suffix=suffix)
                 # ``.ogg`` so ffmpeg can also infer the container from the name;
                 # the explicit ``-f ogg`` is the belt-and-braces (B1).
                 target = self._temp_path("narrator-ogg", temp_paths, suffix=".ogg")
                 with open(source, "wb") as handle:
                     handle.write(audio)
-                self._convert_to_ogg(source, target)
+                self._convert_to_ogg(source, target, input_args=input_args)
                 if not os.path.exists(target) or os.path.getsize(target) == 0:
                     raise NarratorError("narrator conversion produced no audio")
                 with open(target, "rb") as handle:

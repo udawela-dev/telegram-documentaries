@@ -23,8 +23,8 @@ NON_HUMAN_JPEG = (FIXTURES / "non_human.jpg").read_bytes()
 @pytest.fixture(scope="module")
 def classifier() -> LocalVisionClassifier:
     detector = LocalVisionClassifier()
-    if not detector.available:  # Cascade XMLs missing → nothing offline to test
-        pytest.skip("Haar cascades unavailable (opencv data missing)")
+    if not detector.available:  # YuNet model data missing → nothing offline to test
+        pytest.skip("YuNet model unavailable (opencv data missing)")
     return detector
 
 

@@ -10,7 +10,10 @@ documentary about yourself.
 - **Phase 2 — The Bouncer.** The project's **first Google ADK agent**
   (`src/bouncer.py`): an ADK `LlmAgent` on **Gemini 3.1 Flash Lite** that
   classifies an uploaded photo — does it contain a clearly discernible human
-  face or body?
+  face or body? When Gemini is unreachable it falls back to the key-free local
+  **YuNet** face detector; those offline verdicts are labelled
+  **`(offline face check)`** in the chat, because the local detector only finds
+  faces (it cannot tell an animal face from a human one).
 - **Phase 3 — The Interviewer.** The stateful orchestrator
   (`src/interviewer.py` + the shared per-chat state driver
   `src/interview_state.py`): after a human photo is approved it asks seven
@@ -137,7 +140,7 @@ Behaviour:
 | Text after the interview | Re-sends the stored profile + suggested animal |
 | `/start` or `/restart` | Wipes the chat's Bouncer session **and** Interviewer state, purges the stored portrait + Converter session, then invites a fresh photo |
 | Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` then **`Non-human detected`** (rejected + Bouncer session, Interviewer state, stored portrait and Converter session all reset) |
-| Photo when Gemini is unreachable | **Local fallback verdict**: face detected → human verdict; no face → non-human verdict. (Only if the local detector fails too does the graceful "Hang on…" reply appear.) |
+| Photo when Gemini is unreachable | **Local fallback verdict**, labelled as offline: face detected → **`Human detected ✓ (offline face check)`**; no face → **`Non-human detected (offline face check)`**. The local detector only finds faces, so an animal can pass this weak gate (the real discriminator is Gemini). (Only if the local detector fails too does the graceful "Hang on…" reply appear.) |
 
 **The Interviewer state machine.** Interview progress lives on one shared
 per-chat driver (`src/interview_state.py`), keyed by `chat_id`:

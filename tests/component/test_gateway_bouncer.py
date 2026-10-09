@@ -12,9 +12,13 @@ from src.bouncer import (
     BOUNCER_UNAVAILABLE_REPLY,
     BouncerDecision,
     HUMAN_VERDICT_REPLY,
+    HUMAN_VERDICT_REPLY_LOCAL,
     NON_HUMAN_VERDICT_REPLY,
+    NON_HUMAN_VERDICT_REPLY_LOCAL,
 )
 from src.gateway import Gateway, REPLY_TEXT
+from src.interview_state import InterviewStateStore
+from src.interviewer import INTERVIEW_QUESTIONS, Interviewer
 from src.telegram_models import Chat, Message, PhotoSize, TelegramAPIError, TelegramFile, Update
 
 
@@ -50,10 +54,22 @@ class GateClient:
 
 
 class FakeBouncer:
-    """Scripted bouncer: preset verdicts per call, recorded resets."""
+    """Scripted bouncer: preset verdicts per call, recorded resets.
 
-    def __init__(self, verdicts: list[bool], *, classify_raises: Exception | None = None) -> None:
+    ``source`` models which judge produced the verdict — ``"gemini"`` or the
+    key-free local face-check fallback — so the gateway's honest offline
+    labelling can be exercised.
+    """
+
+    def __init__(
+        self,
+        verdicts: list[bool],
+        *,
+        source: str = "gemini",
+        classify_raises: Exception | None = None,
+    ) -> None:
         self._verdicts = list(verdicts)
+        self._source = source
         self._classify_raises = classify_raises
         self.classify_calls: list[tuple[int, int]] = []  # (bytes_len, chat_id)
         self.resets: list[int] = []
@@ -66,6 +82,7 @@ class FakeBouncer:
         return BouncerDecision(
             human_present=human_present,
             reason="clear face" if human_present else "no humans here",
+            source=self._source,
         )
 
     def reset_chat(self, chat_id: int) -> None:
@@ -161,6 +178,63 @@ def test_photo_with_caption_is_gated_not_replied_to_directly():
 
     assert bouncer.classify_calls == [(len(b"image-bytes"), 666)]
     assert client.sent == [(666, REPLY_TEXT), (666, HUMAN_VERDICT_REPLY)]
+
+
+# --- offline verdict labelling --------------------------------------------------
+# A verdict from the key-free local fallback must announce itself as such; a
+# Gemini verdict keeps the standard copy. (An animal can pass the weak offline
+# face gate — the chat must not misrepresent that as a Gemini verdict.)
+
+
+def test_local_verdict_sends_offline_face_check_message(caplog):
+    client = GateClient()
+    bouncer = FakeBouncer(verdicts=[True], source="local")
+    interviewer = Interviewer(store=InterviewStateStore())
+    gateway = Gateway(client, bouncer=bouncer, interviewer=interviewer)
+
+    client.queue([_photo_update(3, chat_id=901, sizes=[("f", 100, 100)])])
+    with caplog.at_level(logging.INFO):
+        gateway.poll_once()
+
+    assert client.sent == [
+        (901, REPLY_TEXT),
+        (901, HUMAN_VERDICT_REPLY_LOCAL),
+        (901, INTERVIEW_QUESTIONS[0]),
+    ]
+    assert any(
+        "event=photo_verdict_sent" in r.message and "source=local" in r.message
+        for r in caplog.records
+    )
+
+
+def test_local_non_human_verdict_sends_offline_face_check_message():
+    client = GateClient()
+    bouncer = FakeBouncer(verdicts=[False], source="local")
+    gateway = Gateway(client, bouncer=bouncer)
+
+    client.queue([_photo_update(4, chat_id=902, sizes=[("f", 100, 100)])])
+    gateway.poll_once()
+
+    assert client.sent == [
+        (902, BOUNCER_REJECTION),
+        (902, NON_HUMAN_VERDICT_REPLY_LOCAL),
+    ]
+
+
+def test_gemini_verdict_keeps_the_standard_message(caplog):
+    client = GateClient()
+    bouncer = FakeBouncer(verdicts=[True], source="gemini")
+    gateway = Gateway(client, bouncer=bouncer)
+
+    client.queue([_photo_update(5, chat_id=903, sizes=[("f", 100, 100)])])
+    with caplog.at_level(logging.INFO):
+        gateway.poll_once()
+
+    assert client.sent == [(903, REPLY_TEXT), (903, HUMAN_VERDICT_REPLY)]
+    assert any(
+        "event=photo_verdict_sent" in r.message and "source=gemini" in r.message
+        for r in caplog.records
+    )
 
 
 # --- degradation paths ---------------------------------------------------------

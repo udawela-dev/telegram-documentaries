@@ -6,10 +6,15 @@
       second message announces "Human detected ✓"** (user decision 2026-10-08:
       the verdict is spoken aloud in chat). Verified offline via the key-free
       fallback (person.jpg → human) AND via the Gemini-approval unit path.
+      **Updated 2026-10-09:** the offline fallback now announces
+      `"Human detected ✓ (offline face check)"`; only Gemini verdicts use the
+      standard copy (see `feature/2026-10-09-offline-verdict-labels`).
 - [x] Non-human photo rejected → cheeky rejection, **then "Non-human detected"**,
       then chat ephemeral state reset. Verified offline via the key-free
       fallback (non_human.jpg → non-human) AND via the Gemini-rejection unit
-      path.
+      path. **Updated 2026-10-09:** the offline fallback now announces
+      `"Non-human detected (offline face check)"`; only Gemini verdicts use the
+      standard copy.
 - [x] Uncertain/parse-failure → reject safely (unit tests).
 - [x] Download/classify failure → graceful reply, loop survives, no reset
       (component tests; also observed live when Gemini refused the key).

@@ -26,6 +26,13 @@ classification only — **no TTS, no video**.
 session resets; either way the process stays alive.
 **Rubric:** graceful handling of invalid input.
 
+**Honest offline label fix** (`feature/2026-10-09-offline-verdict-labels`): the
+key-free local (YuNet) fallback verdicts are labelled "(offline face check)" in
+the chat, so an animal passing the weak offline face gate is never
+misrepresented as a Gemini verdict. The detector only finds *faces* and cannot
+discriminate animals — a documented limit; Gemini remains the real
+discriminator. (Discrimination itself is out of scope: impossible offline.)
+
 ---
 
 ### 3. Interviewer — orchestrator

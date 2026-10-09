@@ -63,7 +63,9 @@ from src.bouncer import (
     BOUNCER_REJECTION,
     BOUNCER_UNAVAILABLE_REPLY,
     HUMAN_VERDICT_REPLY,
+    HUMAN_VERDICT_REPLY_LOCAL,
     NON_HUMAN_VERDICT_REPLY,
+    NON_HUMAN_VERDICT_REPLY_LOCAL,
 )
 from src.converter import CONVERTER_REPLY_UNAVAILABLE
 from src.interview_state import InterviewPhase
@@ -597,11 +599,17 @@ class Gateway:
                         update_id,
                     )
             self._client.send_message(chat_id, self._reply_text)
-            self._client.send_message(chat_id, HUMAN_VERDICT_REPLY)
+            self._client.send_message(
+                chat_id,
+                HUMAN_VERDICT_REPLY_LOCAL
+                if decision.source == "local"
+                else HUMAN_VERDICT_REPLY,
+            )
             logger.info(
-                "event=photo_verdict_sent update_id=%d chat_id=%s verdict=human",
+                "event=photo_verdict_sent update_id=%d chat_id=%s verdict=human source=%s",
                 update_id,
                 chat_id,
+                decision.source,
             )
             # Approved photo = the interview's entry point: Q1 after the verdict.
             if self._interviewer is not None:
@@ -624,11 +632,17 @@ class Gateway:
             decision.reason,
         )
         self._client.send_message(chat_id, BOUNCER_REJECTION)
-        self._client.send_message(chat_id, NON_HUMAN_VERDICT_REPLY)
+        self._client.send_message(
+            chat_id,
+            NON_HUMAN_VERDICT_REPLY_LOCAL
+            if decision.source == "local"
+            else NON_HUMAN_VERDICT_REPLY,
+        )
         logger.info(
-            "event=photo_verdict_sent update_id=%d chat_id=%s verdict=non_human",
+            "event=photo_verdict_sent update_id=%d chat_id=%s verdict=non_human source=%s",
             update_id,
             chat_id,
+            decision.source,
         )
         try:
             self._bouncer.reset_chat(chat_id)
