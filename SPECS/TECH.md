@@ -47,6 +47,25 @@ No webhook mode, no database, no cache layer, no extra services.
   shared `decode_image_bytes` boundary in `src/local_vision.py`). With neither
   available it raises a loud `ConverterError` and the gateway replies
   `CONVERTER_REPLY_UNAVAILABLE` — never a silent fake image.
+- **The Scripter produces exactly one 60–90 word paragraph** (`src/scripter.py`):
+  an ADK `LlmAgent` on `gemini-3.1-flash-lite` receives one text turn embedding
+  the completed `UserProfile` (summary + suggested animal) and returns a single
+  British-wildlife-documentary paragraph, no markdown, TTS-ready. A
+  deterministic local validator (`validate_script`: one paragraph block, word
+  budget, markdown sniff) is the **single shape gate** for both generation
+  paths — an off-spec output is never stored or handed to TTS — and triggers
+  the key-free deterministic `LocalScriptWriter` fallback (`src/local_script.py`)
+  whenever Gemini fails/times out/the key is blocked. Neither available →
+  loud `ScripterError`, gateway replies locked `SCRIPTER_REPLY_UNAVAILABLE`,
+  state untouched, loop survives.
+- **Script delivery order:** after the profile text and the Converter's hybrid
+  photo have been sent for a chat, the gateway runs the Scripter; the validated
+  paragraph is the third and final message (**profile text → hybrid photo →
+  script text**). The Scripter persists the raw string on the shared driver
+  (store first, then the gateway sends the same paragraph); a *delivery*
+  failure logs `event=script_send_failed` loudly — the stored script stays for
+  Phase 6 and no misleading apology is sent. Sessions are per-call fresh and
+  reaped (same rule as the Converter).
 
 ## Contracts at boundaries
 
@@ -76,9 +95,13 @@ No webhook mode, no database, no cache layer, no extra services.
   than misbehave after a schema change.
 - **One shared state driver** owns all reads/writes — stages never mutate state
   directly. The interview stage's driver now exists as `src/interview_state.py`:
-  a versioned `InterviewState` (`schema_version`) keyed by `chat_id` (int) that
-  spans the named phases `idle → interviewing → complete`, with the typed
-  `UserProfile` as the hand-off contract to the next stage.
+  a versioned `InterviewState` (`schema_version`, currently **2**) keyed by
+  `chat_id` (int) that spans the named phases `idle → interviewing → complete`,
+  with the typed `UserProfile` as the hand-off contract to the next stage.
+  Phase 5 adds the nullable `script: str | None` field on the same driver (the
+  raw TTS-ready paragraph for the Phase 6 Narrator); a v1 record is migrated
+  losslessly to v2 (`script=None`, logged `event=state_migrated`) and a record
+  newer than the current version fails loud.
 - **Reset semantics:** `/start` and `/restart` purge session state *and* any
   temporary media files, then return the flow to the initial phase. The process
   itself keeps running.

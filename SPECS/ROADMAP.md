@@ -72,6 +72,19 @@ photo and the dossier; no stray text message between them.
 
 ### 5. Scripter — narration
 
+**Implemented** (`feature/2026-10-09-scripter`): after the profile text and
+the hybrid photo, an ADK `LlmAgent` on `gemini-3.1-flash-lite` produces
+**exactly one 60–90 word British-documentary paragraph** from the completed
+`UserProfile` (`src/scripter.py`), delivered as the final chat message
+(profile → photo → script) and stored raw on the shared state (`script`
+field, schema v2) for the Phase 6 Narrator. A deterministic validator
+(`validate_script`) is the single shape gate for both paths, with a key-free
+local writer fallback (`src/local_script.py`). Offline suite green (342
+passed, 4 skipped — the skips are guarded live-Gemini tests). **Key-blocked
+note:** the key-free local writer is the live path today while `GEMINI_API_KEY`
+stays 403-blocked; the real flash-lite paragraph is exercised by the guarded
+live test the moment a healthy key exists.
+
 Gemini 3.1 Flash Lite produces one dramatic British-documentary paragraph of
 roughly 60–90 words built from the dossier.
 

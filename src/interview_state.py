@@ -35,6 +35,11 @@ class InterviewStateError(RuntimeError):
     """Raised on an illegal transition or corrupt/foreign stored state."""
 
 
+# Current per-chat schema. v1 (pre-Phase-5) had no ``script`` field; records are
+# migrated forward losslessly on read/write and any newer version fails loud.
+SCHEMA_VERSION = 2
+
+
 class InterviewPhase(str, Enum):
     """Explicit interview state machine (TECH.md: named phases)."""
 
@@ -66,7 +71,8 @@ class InterviewState(BaseModel):
     question_index: int = 0  # 0-based, next question to ask
     answers: list[tuple[str, str]] = Field(default_factory=list)  # (question, answer)
     profile: UserProfile | None = None
-    schema_version: int = 1
+    script: str | None = None  # Phase 5 hand-off to the Narrator (raw script text)
+    schema_version: int = SCHEMA_VERSION
     updated_at: str  # ISO-8601 UTC
 
 
@@ -93,21 +99,12 @@ class InterviewStateStore:
             if chat_id not in self._states:
                 return self._fresh_state(chat_id)
             state = self._states[chat_id]
-        if not isinstance(state, InterviewState):
-            raise InterviewStateError(
-                f"corrupt interview state for chat_id={chat_id}: "
-                f"expected InterviewState, found {type(state).__name__}"
-            )
-        if state.chat_id != chat_id:
-            raise InterviewStateError(
-                f"corrupt interview state: key {chat_id} holds chat_id={state.chat_id}"
-            )
-        if state.schema_version != 1:
-            raise InterviewStateError(
-                f"corrupt interview state for chat_id={chat_id}: unsupported "
-                f"schema_version={state.schema_version} (expected 1)"
-            )
-        return state.model_copy(deep=True)
+            normalized = self._normalize(state, chat_id)
+            if normalized is not state:
+                # Persist the forward migration so the store stays at the
+                # current schema (and re-reads no longer need to migrate).
+                self._states[chat_id] = normalized
+        return normalized.model_copy(deep=True)
 
     def save(self, chat_id: int, state: InterviewState) -> None:
         """Persist one chat's state (a copy). Wrong type / mismatched key raise."""
@@ -120,14 +117,53 @@ class InterviewStateStore:
             raise InterviewStateError(
                 f"refusing to save chat {chat_id} state under key {state.chat_id}"
             )
+        normalized = self._normalize(state, chat_id)
         with self._lock:
-            self._states[chat_id] = state.model_copy(deep=True)
+            self._states[chat_id] = normalized.model_copy(deep=True)
 
     def delete(self, chat_id: int) -> None:
         """Purge one chat's state. Idempotent and chat-scoped."""
         self._require_int_chat_id(chat_id)
         with self._lock:
             self._states.pop(chat_id, None)
+
+    @staticmethod
+    def _normalize(state: InterviewState, chat_id: int) -> InterviewState:
+        """Validate a stored/saved record and migrate older schemas forward.
+
+        Only known versions are interpreted: a v1 record (pre-Phase-5, no
+        ``script``) migrates losslessly to v2 with ``script=None`` and a logged
+        ``event=state_migrated``; a version **newer** than the current schema
+        (or an unknown older one) fails loud so old sessions fail predictably
+        rather than misbehave (TECH.md).
+        """
+        if not isinstance(state, InterviewState):
+            raise InterviewStateError(
+                f"corrupt interview state for chat_id={chat_id}: "
+                f"expected InterviewState, found {type(state).__name__}"
+            )
+        if state.chat_id != chat_id:
+            raise InterviewStateError(
+                f"corrupt interview state: key {chat_id} holds chat_id={state.chat_id}"
+            )
+        version = state.schema_version
+        if version == SCHEMA_VERSION:
+            return state
+        if version == 1:
+            migrated = state.model_copy(
+                update={"schema_version": SCHEMA_VERSION, "script": None}
+            )
+            logger.info(
+                "event=state_migrated chat_id=%d from_version=%d to_version=%d",
+                chat_id,
+                version,
+                SCHEMA_VERSION,
+            )
+            return migrated
+        raise InterviewStateError(
+            f"corrupt interview state for chat_id={chat_id}: unsupported "
+            f"schema_version={version} (current {SCHEMA_VERSION})"
+        )
 
     @staticmethod
     def _fresh_state(chat_id: int) -> InterviewState:

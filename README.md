@@ -3,7 +3,7 @@
 Send a portrait to a Telegram bot and receive a narrated, comedy-wildlife
 documentary about yourself.
 
-**Current state: Phases 1 + 2 + 3 + 4.**
+**Current state: Phases 1 + 2 + 3 + 4 + 5.**
 
 - **Phase 1 — the gateway.** A long-polling loop (`src/gateway.py`) that
   replies to text messages with `"Hi Mate"`.
@@ -30,6 +30,18 @@ documentary about yourself.
   raw portrait is retained per chat (`src/portrait_store.py`) and purged on
   `/start`, `/restart`, and rejected photos (which also reset the Converter's
   ADK session).
+- **Phase 5 — The Scripter.** The narrator (`src/scripter.py`): once the
+  profile text *and* the hybrid photo have been delivered, an ADK `LlmAgent`
+  on **Gemini 3.1 Flash Lite** turns the behavioural dossier into **exactly
+  one 60–90 word British-wildlife-documentary paragraph** (no markdown, TTS
+  ready) which arrives in the chat as the final message of the run — order:
+  **profile text → hybrid photo → script text**. The raw script string is
+  stored on the shared per-chat state for the Phase 6 voice note. Key-free
+  resilience (`src/local_script.py`): a deterministic local writer produces
+  the paragraph whenever Gemini fails, times out, the key is blocked, or the
+  output breaks the one-paragraph/word-budget contract; a local validator
+  (`validate_script`) is the single shape gate for both paths, so an
+  off-spec "script" is never stored or spoken.
 
 ## Setup
 
@@ -76,6 +88,13 @@ Optional Converter tuning:
 | `CONVERTER_MODEL`         | `gemini-3.1-flash-image` | Gemini image-generation model for the hybrid portrait. |
 | `CONVERTER_GEMINI_TIMEOUT`| `60`                   | Seconds a Gemini image attempt may take before the local composite is used instead. |
 
+Optional Scripter tuning:
+
+| Variable                | Default                | What it does |
+| ----------------------- | ---------------------- | ------------ |
+| `SCRIPTER_MODEL`        | `gemini-3.1-flash-lite` | Gemini text model for the narration paragraph. |
+| `SCRIPTER_GEMINI_TIMEOUT` | `60`                 | Seconds a Gemini script attempt may take before the key-free local writer is used instead. |
+
 Never commit `.env` — it is gitignored. Both secrets are scrubbed from every
 log record by a redaction filter (`src/logging_utils.py`); the httpx/httpcore
 loggers are silenced at the client so the token-bearing request URLs never leak.
@@ -93,7 +112,7 @@ Behaviour:
 | Text while idle (no interview running) | `Hi Mate` |
 | Photo with a human | `Hi Mate` then **`Human detected ✓`**, then the interview's **Q1** (the interview starts) |
 | Text while interviewing | Exactly **one** next question — the answer is stored in order first |
-| 7th answer | Behavioural profile covering **Habits / Quirks / Routines / Preferences** plus **`Suggested animal: X`**, then a **hybrid portrait photo** of you as that animal arrives automatically |
+| 7th answer | Behavioural profile covering **Habits / Quirks / Routines / Preferences** plus **`Suggested animal: X`**, then a **hybrid portrait photo** of you as that animal, then the **scripted narration** — one dramatic 60–90 word paragraph about you, arriving as the final message (order: profile text → hybrid photo → script text) |
 | Text after the interview | Re-sends the stored profile + suggested animal |
 | `/start` or `/restart` | Wipes the chat's Bouncer session **and** Interviewer state, purges the stored portrait + Converter session, then invites a fresh photo |
 | Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` then **`Non-human detected`** (rejected + Bouncer session, Interviewer state, stored portrait and Converter session all reset) |
@@ -119,6 +138,18 @@ or the key is blocked, `LocalHybridComposer` produces a deterministic
 photo-booth composite instead; with neither available the gateway replies
 gracefully (`CONVERTER_REPLY_UNAVAILABLE`) and the loop survives.
 
+**The Scripter stage.** After the hybrid photo, the gateway runs the Scripter
+for that chat: `write_script` asks Gemini (one text turn embedding the profile
+summary + suggested animal) for exactly one 60–90 word documentary paragraph,
+validates the shape (`validate_script` — one paragraph, word budget, no
+markdown), persists the raw string on the shared per-chat state (`script`
+field, schema `v2`), and the gateway sends the same paragraph back as the
+final text message. Any Gemini failure/timeout/blocked-key/off-shape output
+falls back to the deterministic `LocalScriptWriter`; if nothing can produce a
+valid paragraph the chat gets `SCRIPTER_REPLY_UNAVAILABLE` and nothing is
+stored. Like the Converter, each call starts from a fresh ADK session and
+reaps it afterwards. Phase 6 (Narrator/TTS) will read the stored `script`.
+
 Stop it with `Ctrl-C` (SIGINT) or SIGTERM — it shuts down gracefully.
 
 ## Checks (ground truth)
@@ -131,13 +162,14 @@ Stop it with `Ctrl-C` (SIGINT) or SIGTERM — it shuts down gracefully.
 Live Gemini verification is **opt-in** (offline suite never requires a key):
 
 ```bash
-RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py tests/integration/test_live_converter.py -v
+RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py tests/integration/test_live_converter.py tests/integration/test_live_scripter.py -v
 ```
 
 It classifies committed fixtures (`tests/fixtures/person.jpg` — expect
-`human_present: true`; `tests/fixtures/non_human.jpg` — expect `false`) and
-converts that portrait into a real `gemini-3.1-flash-image` hybrid, using the
-key in `.env`.
+`human_present: true`; `tests/fixtures/non_human.jpg` — expect `false`),
+converts that portrait into a real `gemini-3.1-flash-image` hybrid, and writes
+a real `gemini-3.1-flash-lite` 60–90 word script from a seeded profile, using
+the key in `.env`.
 
 ## Architecture
 
@@ -146,13 +178,16 @@ key in `.env`.
 download for photos and `send_photo`) → `src/bouncer.py` (ADK agent + per-chat
 in-memory sessions, with a hard 60s Gemini timeout) + `src/local_vision.py`
 (key-free YuNet face detector, bundled model in `src/data/`, shared
-`decode_image_bytes` boundary) → `src/gateway.py` (polling loop + dispatcher +
-photo gate + interview routing + conversion) → `src/interviewer.py` (ADK
+`decode_image_bytes` boundary) → `src/gateway.py` (polling loop + dispatcher + photo gate + interview routing +
+conversion + scripting) → `src/interviewer.py` (ADK
 backbone + deterministic 7-question bank + animal matcher) backed by
 `src/interview_state.py` (shared per-chat state driver) → `src/converter.py`
 (ADK image agent on `gemini-3.1-flash-image`, one multimodal call, per-call
 fresh + reaped sessions) with `src/portrait_store.py` (per-chat raw portrait)
-and `src/local_composite.py` (key-free photo-booth fallback).
+and `src/local_composite.py` (key-free photo-booth fallback) →
+`src/scripter.py` (ADK text agent on `gemini-3.1-flash-lite`, one 60–90 word
+documentary paragraph, `validate_script` shape gate, per-call fresh + reaped
+sessions) with `src/local_script.py` (key-free deterministic writer).
 
 The Bouncer's verdict order: **Gemini (ADK agent) first**; on failure or
 timeout it falls back to the local YuNet detector so a photo always gets a

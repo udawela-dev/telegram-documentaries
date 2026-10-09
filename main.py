@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Entry point — The Telegram Documentaries, Phases 1–4.
+"""Entry point — The Telegram Documentaries, Phases 1–5.
 
 Long-polling loop that replies to every text message with the confirmation
 text while idle. Photo uploads pass through **The Bouncer** (an ADK LlmAgent on
@@ -14,6 +14,12 @@ photo + profile and sends it straight to the chat. While the Gemini key is
 blocked, a deterministic OpenCV photo-booth composer produces the image
 instead; the local composer is wired as the resilience fallback exactly like
 the Bouncer's local face detector.
+
+Then **The Scripter** (Phase 5) fires: an ADK text agent on Gemini 3.1 Flash
+Lite turns the profile into one 60–90 word British-wildlife-documentary
+paragraph, sends it to the chat, and stores the raw string on the shared state
+for the Phase 6 Narrator. While the Gemini key is blocked, the deterministic
+key-free ``LocalScriptWriter`` produces the paragraph instead.
 
 When Gemini cannot be reached (missing/blocked API key, network failure,
 timeout) the Bouncer falls back to a key-free OpenCV face detector, so photo
@@ -39,9 +45,11 @@ from src.converter import Converter
 from src.gateway import Gateway
 from src.interview_state import InterviewStateStore
 from src.interviewer import Interviewer
+from src.local_script import LocalScriptWriter
 from src.local_vision import LocalVisionClassifier
 from src.logging_utils import configure_logging
 from src.portrait_store import PortraitStore
+from src.scripter import Scripter
 from src.telegram_client import TelegramClient
 
 
@@ -129,6 +137,22 @@ def main() -> int:
             "event=converter_unavailable reason=no_gemini_key_and_no_local_composer"
         )
 
+    # The Scripter (Phase 5) turns the completed profile into one narration
+    # paragraph: an ADK text agent on gemini-3.1-flash-lite plus the key-free
+    # deterministic local writer (always available), on the SAME shared state
+    # store so the raw script is stored for the Phase 6 Narrator.
+    local_script_writer = LocalScriptWriter()
+    scripter = Scripter(
+        api_key=settings.gemini_api_key,
+        store=interview_store,
+        local_writer=local_script_writer,
+    )
+    logger.info(
+        "event=scripter_ready model=%s local_fallback=true", scripter.model
+    )
+    if not settings.gemini_api_key:
+        logger.warning("event=scripter_local_only reason=missing_gemini_api_key")
+
     client = TelegramClient(token=settings.telegram_bot_token)
     gateway = Gateway(
         client,
@@ -136,6 +160,7 @@ def main() -> int:
         interviewer=interviewer,
         converter=converter,
         portraits=portraits,
+        scripter=scripter,
     )
     try:
         gateway.run(stop_event)

@@ -1,4 +1,4 @@
-"""Phase 1+2+3+4 gateway: long-polling loop + dispatcher (Bouncer → Interviewer → Converter).
+"""Phase 1+2+3+4+5 gateway: long-polling loop + dispatcher (Bouncer → Interviewer → Converter → Scripter).
 
 Behaviour contract:
 * every TEXT message gets the confirmation reply — no state, no branching —
@@ -18,6 +18,16 @@ Behaviour contract:
   chat; missing portrait/profile or any converter/photo failure → loud log +
   graceful ``CONVERTER_REPLY_UNAVAILABLE`` reply, loop survives. With no
   converter (or no portrait store) wired, completion is exactly Phase 3;
+* after the hybrid image (Phase 5) the Scripter runs for that chat (only when
+  the conversion succeeded and a profile exists): the generated 60-90 word
+  paragraph is sent as the third and final message of the run (chat order:
+  profile text → hybrid photo → script text — asserted via the component
+  suite) and the raw script string was stored on the shared driver by the
+  Scripter for the Phase 6 Narrator. Generation failure → loud log + graceful
+  ``SCRIPTER_REPLY_UNAVAILABLE`` reply, state untouched; delivery (send)
+  failure → loud ``event=script_send_failed`` log, no misleading apology (the
+  script was produced and stored; only the send failed), loop survives. With
+  no scripter wired, completion is exactly Phase 4;
 * ``/start`` and ``/restart`` (with an interviewer wired) reset both stages and
   purge the stored portrait, then send a confirmation reply; without an
   interviewer every text, commands included, gets the confirmation reply
@@ -46,6 +56,7 @@ from src.bouncer import (
 from src.converter import CONVERTER_REPLY_UNAVAILABLE
 from src.interview_state import InterviewPhase
 from src.interviewer import INTERVIEWER_REPLY_RESET, INTERVIEWER_REPLY_UNAVAILABLE
+from src.scripter import SCRIPTER_REPLY_UNAVAILABLE
 from src.telegram_models import Message, TelegramAPIError, Update
 
 logger = logging.getLogger(__name__)
@@ -62,6 +73,7 @@ class Gateway:
         interviewer=None,
         converter=None,
         portraits=None,
+        scripter=None,
         reply_text: str = REPLY_TEXT,
         poll_timeout: int = 30,
         backoff_seconds: float = 0.5,
@@ -74,6 +86,9 @@ class Gateway:
         # interview-completion path is exactly Phase 3 (no extra media/replies).
         self._converter = converter
         self._portraits = portraits
+        # Phase 5: the scripter. When None, completion is exactly Phases 3+4
+        # (no script produced or sent).
+        self._scripter = scripter
         self._reply_text = reply_text
         self._poll_timeout = poll_timeout
         self._backoff_seconds = backoff_seconds
@@ -297,6 +312,65 @@ class Gateway:
             update_id,
             len(hybrid),
         )
+
+        # Phase 5: script the narration only after the profile text AND the
+        # hybrid photo have been delivered for this chat.
+        self._handle_scripting(chat_id, profile, update_id)
+
+    def _handle_scripting(self, chat_id: int, profile, update_id: int) -> None:
+        """Send the narration after the hybrid photo (Phase 5).
+
+        Inactive when no scripter is wired — exactly Phases 3+4. The scripter
+        produces + stores the validated paragraph; the gateway then sends that
+        same text to the chat (chat-visible order: profile text → hybrid photo →
+        script text). Any scripter *generation* failure → loud log + graceful
+        ``SCRIPTER_REPLY_UNAVAILABLE`` (nothing was stored); a pure *delivery*
+        failure → loud ``script_send_failed`` log and no apology (the script was
+        produced and stored, so it stays for Phase 6). The polling loop always
+        survives.
+        """
+        if self._scripter is None:
+            return  # Phases-3+4 regression: no scripter, no extra replies/events
+
+        # Defensive only: every caller already returned when profile is None, so
+        # this branch is currently unreachable. Kept so a future caller cannot
+        # quietly skip the narration.
+        if profile is None:
+            logger.error(
+                "event=script_failed chat_id=%s update_id=%d reason=profile_missing",
+                chat_id,
+                update_id,
+            )
+            self._client.send_message(chat_id, SCRIPTER_REPLY_UNAVAILABLE)
+            return
+
+        logger.info(
+            "event=scripter_started chat_id=%s update_id=%d", chat_id, update_id
+        )
+        try:
+            script = self._scripter.write_script(chat_id, profile)
+        except Exception:
+            logger.exception(
+                "event=script_failed chat_id=%s update_id=%d stage=write_script",
+                chat_id,
+                update_id,
+            )
+            self._client.send_message(chat_id, SCRIPTER_REPLY_UNAVAILABLE)
+            return
+
+        try:
+            self._client.send_message(chat_id, script)
+        except Exception as exc:
+            # The script WAS produced and stored — only its delivery failed. Do
+            # NOT send SCRIPTER_REPLY_UNAVAILABLE: that copy claims no script was
+            # made, which is false here, and would mislead the user. The stored
+            # ``state.script`` stays for Phase 6 and the loop survives.
+            logger.exception(
+                "event=script_send_failed chat_id=%s update_id=%d error_type=%s",
+                chat_id,
+                update_id,
+                type(exc).__name__,
+            )
 
     def _handle_reset_command(self, chat_id: int, update_id: int) -> bool:
         """``/start`` or ``/restart``: purge Bouncer session + Interviewer state.
