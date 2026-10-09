@@ -1,0 +1,28 @@
+# SECRETS — never commit (see SPECS/MISSION.md non-negotiables)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Generated media / temp state
+*.ogg
+*.mp3
+*.jpg
+*.jpeg
+*.png
+
+# ...but committed vision test fixtures are always tracked (Bouncer gate tests)
+!tests/fixtures/
+!tests/fixtures/*.jpg
+!tests/fixtures/*.jpeg
+!tests/fixtures/*.png
+
+# Tooling / editors
+.codio
+.settings
+.opencode/node_modules/
