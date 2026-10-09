@@ -3,7 +3,8 @@
 Send a portrait to a Telegram bot and receive a narrated, comedy-wildlife
 documentary about yourself.
 
-**Current state: Phases 1 + 2 + 3 + 4 + 5 + 6.**
+**Current state: Phases 1–8.** (gateway → Bouncer → Interviewer → Converter →
+Scripter → Narrator → resilience & polish → presenter personas)
 
 - **Phase 1 — the gateway.** A long-polling loop (`src/gateway.py`) that
   replies to text messages with `"Hi Mate"`.
@@ -237,7 +238,7 @@ Stop it with `Ctrl-C` (SIGINT) or SIGTERM — it shuts down gracefully.
 Live Gemini verification is **opt-in** (offline suite never requires a key):
 
 ```bash
-RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py tests/integration/test_live_converter.py tests/integration/test_live_scripter.py tests/integration/test_live_narrator.py -v
+RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py tests/integration/test_live_converter.py tests/integration/test_live_scripter.py tests/integration/test_live_narrator.py tests/integration/test_live_personas.py -v
 ```
 
 It classifies committed fixtures (`tests/fixtures/person.jpg` — expect
@@ -264,7 +265,10 @@ and `src/local_composite.py` (key-free photo-booth fallback) →
 `src/scripter.py` (ADK text agent on `gemini-3.1-flash-lite`, one 60–90 word
 documentary paragraph, `validate_script` shape gate, per-call fresh + reaped
 sessions) with `src/local_script.py` (key-free deterministic writer) →
-`src/narrator.py` (**direct** `gemini-3.1-flash-tts-preview` call — not an
+`src/persona.py` (Phase 8 single owner of presenter copy — typed `Persona`,
+script tones, per-persona TTS voices/instructions — wired into the gateway's
+`/persona` command, the Scripter and the Narrator) → `src/narrator.py`
+(**direct** `gemini-3.1-flash-tts-preview` call — not an
 agent — voice note via `send_voice`; temp-file lifecycle with
 `finally`-cleanup; ffmpeg OGG/Opus conversion seam when needed; no local TTS
 fallback).
