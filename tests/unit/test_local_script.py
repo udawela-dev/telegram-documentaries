@@ -9,7 +9,8 @@ import pytest
 
 from src.interview_state import UserProfile
 from src.interviewer import ANIMAL_KEYWORD_FAMILIES, DEFAULT_SUGGESTED_ANIMAL
-from src.local_script import LocalScriptWriter
+from src.local_script import TEMPLATE, LocalScriptWriter
+from src.persona import Persona
 from src.scripter import SCRIPTER_MAX_WORDS, SCRIPTER_MIN_WORDS, validate_script
 
 # Every canonical animal the Interviewer can produce, plus the locked default.
@@ -70,3 +71,51 @@ def test_write_with_the_locked_default_animal_is_valid():
 
     assert DEFAULT_SUGGESTED_ANIMAL in script
     assert validate_script(script) is not None
+
+
+# --- persona tone (Phase 8) --------------------------------------------------------
+
+
+def test_write_defaults_to_the_attenborough_template_unchanged():
+    """Backward compatibility by construction: no persona == exactly Phase 7."""
+    writer = LocalScriptWriter()
+    profile = _profile("the Night Owl")
+
+    assert writer.write(profile) == TEMPLATE.format(animal=profile.suggested_animal)
+    assert writer.write(profile, Persona.ATTENBOROUGH) == writer.write(profile)
+
+
+def test_write_honours_the_irwin_persona_tone():
+    writer = LocalScriptWriter()
+    profile = _profile("the Saltwater Croc")
+
+    attenborough = writer.write(profile, Persona.ATTENBOROUGH)
+    irwin = writer.write(profile, Persona.IRWIN)
+
+    assert irwin != attenborough
+    assert irwin.startswith("Crikey!")
+    assert irwin.endswith(TEMPLATE.format(animal=profile.suggested_animal))
+
+
+@pytest.mark.parametrize("persona", list(Persona))
+@pytest.mark.parametrize("animal", CANONICAL_ANIMALS)
+def test_write_output_stays_in_budget_for_every_persona_and_animal(persona, animal):
+    script = LocalScriptWriter().write(_profile(animal), persona)
+
+    assert "\n" not in script
+    assert SCRIPTER_MIN_WORDS <= len(script.split()) <= SCRIPTER_MAX_WORDS
+    assert animal in script
+    assert validate_script(script) is not None
+
+
+def test_write_is_deterministic_per_persona():
+    profile = _profile("the Sea Otter")
+
+    assert LocalScriptWriter().write(profile, Persona.IRWIN) == LocalScriptWriter().write(
+        profile, Persona.IRWIN
+    )
+
+
+def test_write_rejects_a_free_text_persona():
+    with pytest.raises(TypeError):
+        LocalScriptWriter().write(_profile(), "irwin")  # type: ignore[arg-type]

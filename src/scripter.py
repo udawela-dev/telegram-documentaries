@@ -46,6 +46,7 @@ from src.interview_state import (
     utc_now_iso,
 )
 from src.logging_utils import log_call
+from src.persona import PERSONA_SCRIPT_TONE, Persona
 
 if TYPE_CHECKING:  # avoids any runtime dependency for importers
     from src.local_script import LocalScriptWriter
@@ -99,6 +100,18 @@ _MARKDOWN_PATTERNS: tuple[re.Pattern[str], ...] = (
 def resolve_model() -> str:
     """Resolve the Scripter's Gemini model at call time — env override wins."""
     return os.getenv("SCRIPTER_MODEL", DEFAULT_SCRIPTER_MODEL)
+
+
+def persona_instruction(persona: Persona) -> str:
+    """Compose the run's instruction: the persona's tone prepended to the base.
+
+    The base :data:`INSTRUCTION` is unchanged by persona (only a leading tone
+    snippet is added), so the Scripter's task contract is identical for both
+    presenters. Rejects free text: only a typed :class:`Persona` is accepted.
+    """
+    if not isinstance(persona, Persona):
+        raise ScripterError(f"unknown persona: {persona!r}")
+    return f"{PERSONA_SCRIPT_TONE[persona]}\n\n{INSTRUCTION}"
 
 
 def validate_script(text: str) -> str | None:
@@ -272,14 +285,18 @@ class Scripter:
         return outcome["value"]
 
     def _generate(
-        self, chat_id: int, profile: UserProfile, session_id: str
+        self, chat_id: int, profile: UserProfile, session_id: str, persona: Persona
     ) -> tuple[str, str]:
         """Return ``(validated_script, source)``; Gemini first, local fallback.
 
         A shape-rejected LLM output is treated exactly like an LLM failure: the
         local writer produces the paragraph instead and an off-spec text is
-        never returned or stored.
+        never returned or stored. ``persona`` colours both paths (the ADK agent
+        instruction for Gemini, the opener for the local writer).
         """
+        # ADK resolves ``canonical_instruction`` per run, so setting it here
+        # (before the runner starts) applies persona tone to this run only.
+        self._agent.instruction = persona_instruction(persona)
         if self._has_gemini:
             try:
                 text = self._llm_bounded(self._prompt_content(profile), session_id)
@@ -305,7 +322,7 @@ class Scripter:
             )
 
         try:
-            text = self._local.write(profile)
+            text = self._local.write(profile, persona)
         except Exception as exc:
             raise ScripterError(
                 f"local script writer failed for chat {chat_id}: "
@@ -340,22 +357,30 @@ class Scripter:
             ) from exc
 
     @log_call(event="scripter_write_script")
-    def write_script(self, chat_id: int, profile: UserProfile) -> str:
+    def write_script(
+        self, chat_id: int, profile: UserProfile, persona: Persona = Persona.ATTENBOROUGH
+    ) -> str:
         """Produce, validate and store one narration paragraph for a chat.
 
         Gemini first; on any failure/timeout/blocked key or a rejected shape the
         key-free local writer (if wired) produces the paragraph. With neither
         available — or the store rejecting the write — raises ``ScripterError``.
         The raw string is stored on the shared ``InterviewState`` for Phase 6.
+
+        ``persona`` colours the narration tone; it defaults to
+        ``attenborough`` so callers that never resolved a persona keep the
+        Phase 7 behaviour exactly.
         """
         if isinstance(chat_id, bool) or not isinstance(chat_id, int):
             raise ScripterError(f"chat_id must be int, got {type(chat_id).__name__}")
         if not isinstance(profile, UserProfile):
             raise ScripterError(f"write_script requires a UserProfile for chat {chat_id}")
+        if not isinstance(persona, Persona):
+            raise ScripterError(f"unknown persona: {persona!r}")
 
         session_id = self._fresh_session(chat_id)
         try:
-            script, source = self._generate(chat_id, profile, session_id)
+            script, source = self._generate(chat_id, profile, session_id, persona)
         finally:
             # The narration is one-shot: drop the session so neither the prompt
             # nor the paragraph stays in memory for the chat's life.

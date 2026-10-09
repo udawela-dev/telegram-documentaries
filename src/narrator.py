@@ -40,6 +40,12 @@ from typing import Any
 from google.genai import types as genai_types
 
 from src.logging_utils import redact
+from src.persona import (
+    PERSONA_NARRATOR_INSTRUCTION,
+    PERSONA_NARRATOR_VOICE,
+    Persona,
+    resolve_persona_voice,
+)
 from src.temp_assets import TempAssets
 
 logger = logging.getLogger(__name__)
@@ -57,15 +63,15 @@ DEFAULT_NARRATOR_TIMEOUT = 60  # seconds (int; bounded via daemon thread + Event
 # Default prebuilt voice for the locked direction "deep male, posh British,
 # classic British-wildlife-documentary presenter". "Orus" is documented with a
 # firm, low-register timbre — the closest prebuilt fit. Overridable per
-# deployment with ``NARRATOR_VOICE``.
-DEFAULT_NARRATOR_VOICE = "Orus"
+# deployment with ``NARRATOR_VOICE``. Phase 8 owns this string in
+# :mod:`src.persona` (the attenborough persona's default); imported here so the
+# Phase 6 constants stay a single source of truth.
+DEFAULT_NARRATOR_VOICE = PERSONA_NARRATOR_VOICE[Persona.ATTENBOROUGH]
 
 # Short style/persona instruction embedded in the request text. The prebuilt
 # voice name carries the timbre; this reinforces the delivery/character.
-NARRATOR_PERSONA = (
-    "Narrate in a classic British wildlife documentary presenter voice: deep, "
-    "male, posh British accent. Speak clearly and dramatically."
-)
+# Phase 8 owns this string in :mod:`src.persona` too (the attenborough entry).
+NARRATOR_PERSONA = PERSONA_NARRATOR_INSTRUCTION[Persona.ATTENBOROUGH]
 
 # MIME types our conversion seam treats as already sendVoice-compatible.
 _OGG_MIME_TYPES = frozenset({"audio/ogg", "audio/opus", "application/ogg"})
@@ -158,6 +164,12 @@ class Narrator:
         # Phase 7: the shared per-chat temp-asset registry (sweep-net so a reset
         # can purge files staged by a worker that was interrupted mid-flight).
         self._temp_assets = temp_assets
+        # Phase 8: the persona context for the current ``synthesize`` call.
+        # ``None`` means "no persona in effect" → the Phase 6 defaults
+        # (``NARRATOR_PERSONA`` / the constructor ``self._voice``) apply, so a
+        # direct ``_run_tts`` call behaves exactly as before.
+        self._active_voice: str | None = None
+        self._active_instruction: str | None = None
 
     @property
     def model(self) -> str:
@@ -191,17 +203,28 @@ class Narrator:
         return self._client
 
     def _request_text(self, script: str) -> str:
-        """Persona/style instruction followed by the raw Phase 5 script."""
-        return f"{NARRATOR_PERSONA}\n\n{script}"
+        """Persona/style instruction followed by the raw Phase 5 script.
+
+        Prefers the persona instruction set by the current ``synthesize`` call;
+        absent one (e.g. a direct ``_run_tts`` call), the Phase 6
+        ``NARRATOR_PERSONA`` applies unchanged.
+        """
+        instruction = self._active_instruction or NARRATOR_PERSONA
+        return f"{instruction}\n\n{script}"
 
     def _build_config(self) -> genai_types.GenerateContentConfig:
-        """The locked single-speaker AUDIO request config."""
+        """The locked single-speaker AUDIO request config.
+
+        Uses the persona voice set by the current ``synthesize`` call; absent
+        one (e.g. a direct ``_run_tts`` call), the constructor's ``self._voice``
+        applies unchanged.
+        """
         return genai_types.GenerateContentConfig(
             response_modalities=["AUDIO"],
             speech_config=genai_types.SpeechConfig(
                 voice_config=genai_types.VoiceConfig(
                     prebuilt_voice_config=genai_types.PrebuiltVoiceConfig(
-                        voice_name=self._voice
+                        voice_name=self._active_voice or self._voice
                     )
                 )
             ),
@@ -475,8 +498,15 @@ class Narrator:
 
     # --- public API -------------------------------------------------------------
 
-    def synthesize(self, chat_id: int, script: str) -> bytes:
+    def synthesize(
+        self, chat_id: int, script: str, persona: Persona = Persona.ATTENBOROUGH
+    ) -> bytes:
         """Render ``script`` to Telegram-compatible audio bytes for ``chat_id``.
+
+        ``persona`` selects the prebuilt voice (via
+        :func:`src.persona.resolve_persona_voice`, applied at call time) and the
+        style instruction. It defaults to ``attenborough`` so callers that never
+        resolved a persona keep the Phase 6 behaviour exactly.
 
         The audio is staged through temp file(s), converted to OGG/Opus when
         needed, and the temp files are always unlinked in a ``finally`` (success
@@ -489,6 +519,15 @@ class Narrator:
             raise NarratorError(
                 f"narrator requires a non-empty script for chat {chat_id}"
             )
+        if not isinstance(persona, Persona):
+            raise NarratorError(f"unknown persona: {persona!r}")
+
+        # The persona context is read by the TTS worker thread via
+        # ``_request_text``/``_build_config``; set before the worker starts and
+        # cleared in the same ``finally`` that reaps temp files (after the
+        # bounded call has joined, so the worker always sees this call's values).
+        self._active_voice = resolve_persona_voice(persona)
+        self._active_instruction = PERSONA_NARRATOR_INSTRUCTION[persona]
 
         temp_paths: list[str] = []
         try:
@@ -539,4 +578,8 @@ class Narrator:
             )
             return final
         finally:
+            # Clear the per-call persona context before/as we clean up, so a
+            # later direct ``_run_tts`` call is back on the Phase 6 defaults.
+            self._active_voice = None
+            self._active_instruction = None
             self._cleanup_temp_paths(temp_paths)

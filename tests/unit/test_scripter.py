@@ -23,8 +23,11 @@ from src.interview_state import (
     UserProfile,
     utc_now_iso,
 )
+from src.local_script import LocalScriptWriter
+from src.persona import PERSONA_SCRIPT_TONE, Persona
 from src.scripter import (
     DEFAULT_SCRIPTER_MODEL,
+    INSTRUCTION,
     SCRIPTER_MAX_WORDS,
     SCRIPTER_MIN_WORDS,
     SCRIPTER_MODEL,
@@ -125,10 +128,24 @@ class FakeLocalWriter:
     def __init__(self, script: str = _paragraph(70)) -> None:
         self.script = script
         self.calls: list[UserProfile] = []
+        self.personas: list = []
 
-    def write(self, profile: UserProfile) -> str:
+    def write(self, profile: UserProfile, persona=Persona.ATTENBOROUGH) -> str:
         self.calls.append(profile)
+        self.personas.append(persona)
         return self.script
+
+
+class InstructionSpyScripter(ScriptedScripter):
+    """Records the agent instruction actually in effect during each LLM run."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.seen_instructions: list[str] = []
+
+    def _run_llm(self, content, session_id: str) -> str:
+        self.seen_instructions.append(self._agent.instruction)
+        return super()._run_llm(content, session_id)
 
 
 # --- validate_script: the single shape gate ------------------------------------
@@ -531,3 +548,85 @@ def test_word_budget_constants_are_locked():
 
 def test_default_gemini_timeout_is_locked():
     assert Scripter.DEFAULT_GEMINI_TIMEOUT_SECONDS == 60.0
+
+
+# --- persona tone (Phase 8) --------------------------------------------------------
+
+
+@pytest.mark.parametrize("persona", list(Persona))
+def test_write_script_prepends_the_persona_tone_to_the_agent_instruction(persona):
+    """The persona's tone reaches the instruction the ADK agent runs with."""
+    store = InterviewStateStore()
+    _save_state(store, 700, _profile())
+    scripter = InstructionSpyScripter(script=_paragraph(70), api_key="x", store=store)
+
+    scripter.write_script(700, _profile(), persona)
+
+    assert scripter.seen_instructions, "the LLM ran with no recorded instruction"
+    instruction = scripter.seen_instructions[-1]
+    assert instruction.startswith(PERSONA_SCRIPT_TONE[persona]), (
+        "the persona tone must be prepended to the LLM instruction"
+    )
+    assert instruction.endswith(INSTRUCTION), (
+        "the base scripter instruction must still be part of the run"
+    )
+
+
+def test_write_script_defaults_to_the_attenborough_tone_without_a_persona():
+    """Backward compatibility by construction: no persona → Phase 7 behaviour."""
+    store = InterviewStateStore()
+    _save_state(store, 701, _profile())
+    scripter = InstructionSpyScripter(script=_paragraph(70), api_key="x", store=store)
+
+    scripter.write_script(701, _profile())
+
+    assert scripter.seen_instructions[-1].startswith(
+        PERSONA_SCRIPT_TONE[Persona.ATTENBOROUGH]
+    )
+
+
+@pytest.mark.parametrize("persona", list(Persona))
+def test_write_script_passes_the_persona_to_the_local_writer(persona):
+    store = InterviewStateStore()
+    _save_state(store, 702, _profile())
+    local = FakeLocalWriter(script=_paragraph(70))
+    scripter = FailingScripter(api_key="x", store=store, local_writer=local)
+
+    scripter.write_script(702, _profile(), persona)
+
+    assert local.personas == [persona]
+
+
+def test_write_script_rejects_a_free_text_persona():
+    """Typed boundary: only a Persona may enter — never free text."""
+    store = InterviewStateStore()
+    _save_state(store, 703, _profile())
+    scripter = ScriptedScripter(api_key="x", store=store)
+
+    with pytest.raises(ScripterError):
+        scripter.write_script(703, _profile(), "irwin")  # type: ignore[arg-type]
+
+
+def test_persona_toned_script_still_passes_the_shape_gate():
+    """The one-paragraph/60–90-word/no-markdown contract gates BOTH personas."""
+    store = InterviewStateStore()
+    _save_state(store, 704, _profile())
+    scripter = FailingScripter(api_key="x", store=store, local_writer=LocalScriptWriter())
+
+    for persona in list(Persona):
+        script = scripter.write_script(704, _profile(), persona)
+
+        assert validate_script(script) is not None
+        assert SCRIPTER_MIN_WORDS <= len(script.split()) <= SCRIPTER_MAX_WORDS
+
+
+def test_the_two_personas_produce_different_paragraphs_via_the_local_path():
+    store = InterviewStateStore()
+    _save_state(store, 705, _profile())
+    scripter = FailingScripter(api_key="x", store=store, local_writer=LocalScriptWriter())
+
+    attenborough = scripter.write_script(705, _profile(), Persona.ATTENBOROUGH)
+    irwin = scripter.write_script(705, _profile(), Persona.IRWIN)
+
+    assert attenborough != irwin, "the persona must colour the narration"
+    assert irwin.startswith("Crikey!")

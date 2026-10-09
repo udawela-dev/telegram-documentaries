@@ -17,6 +17,10 @@ from src.gateway import (
     GATEWAY_REPLY_NEED_PHOTO,
     GATEWAY_REPLY_PHOTO_DURING_INTERVIEW,
     GATEWAY_REPLY_RETRY_HINT,
+    GATEWAY_REPLY_UNKNOWN_COMMAND,
+    PERSONA_REPLY_CONFIRMED_ATTENBOROUGH,
+    PERSONA_REPLY_CONFIRMED_IRWIN,
+    PERSONA_REPLY_USAGE,
     Gateway,
 )
 from src.interview_state import (
@@ -31,6 +35,7 @@ from src.interviewer import (
     INTERVIEWER_REPLY_RESET,
     Interviewer,
 )
+from src.persona import Persona
 from src.portrait_store import PortraitStore
 from src.telegram_models import Chat, Message, PhotoSize, Update
 from src.temp_assets import TempAssets
@@ -117,10 +122,12 @@ class RecordScripter:
     def __init__(self, on_write=None) -> None:
         self.write_calls: list[int] = []
         self.resets: list[int] = []
+        self.personas: list[Persona] = []
         self._on_write = on_write
 
-    def write_script(self, chat_id: int, profile) -> str:
+    def write_script(self, chat_id: int, profile, persona: Persona = Persona.ATTENBOROUGH) -> str:
         self.write_calls.append(chat_id)
+        self.personas.append(persona)
         if self._on_write is not None:
             self._on_write()
         return "a perfectly formed screenplay paragraph"
@@ -132,10 +139,12 @@ class RecordScripter:
 class RecordNarrator:
     def __init__(self, on_synthesize=None) -> None:
         self.synthesize_calls: list[int] = []
+        self.personas: list[Persona] = []
         self._on_synthesize = on_synthesize
 
-    def synthesize(self, chat_id: int, script: str) -> bytes:
+    def synthesize(self, chat_id: int, script: str, persona: Persona = Persona.ATTENBOROUGH) -> bytes:
         self.synthesize_calls.append(chat_id)
+        self.personas.append(persona)
         if self._on_synthesize is not None:
             self._on_synthesize()
         return b"voice-bytes"
@@ -421,3 +430,250 @@ def test_poll_survives_exploding_stage_and_keeps_answering():
     # The photo failed gracefully; the very next text still gets served.
     assert any(t == GATEWAY_REPLY_RETRY_HINT for _, t in client.sent_text)
     assert (101, GATEWAY_REPLY_NEED_PHOTO) in client.sent_text
+
+
+# --- /persona command + persona store (Phase 8) ---------------------------------
+
+
+def _complete_store(chat_id: int) -> InterviewStateStore:
+    store = InterviewStateStore()
+    store.save(
+        chat_id,
+        InterviewState(
+            chat_id=chat_id,
+            phase=InterviewPhase.COMPLETE,
+            profile=_profile(chat_id),
+            updated_at=utc_now_iso(),
+        ),
+    )
+    return store
+
+
+def test_persona_command_without_an_argument_replies_usage():
+    client = UClient()
+    interviewer, _ = _interviewer_store()
+    gateway = Gateway(client, interviewer=interviewer)
+
+    assert gateway._dispatch(_text_update(1, 101, "/persona")) is True
+
+    assert client.sent_text == [(101, PERSONA_REPLY_USAGE)]
+    assert gateway._personas == {}, "no persona selected on a bare /persona"
+
+
+@pytest.mark.parametrize(
+    "token,persona,expected",
+    [
+        ("attenborough", Persona.ATTENBOROUGH, PERSONA_REPLY_CONFIRMED_ATTENBOROUGH),
+        ("irwin", Persona.IRWIN, PERSONA_REPLY_CONFIRMED_IRWIN),
+        (" IRWIN ", Persona.IRWIN, PERSONA_REPLY_CONFIRMED_IRWIN),
+    ],
+)
+def test_persona_command_switches_and_confirms(token, persona, expected, caplog):
+    client = UClient()
+    interviewer, _ = _interviewer_store()
+    gateway = Gateway(client, interviewer=interviewer)
+
+    gateway._dispatch(_text_update(1, 101, f"/persona {token}"))
+
+    assert client.sent_text == [(101, expected)]
+    assert gateway._personas[101] is persona
+    assert "event=persona_set" in caplog.text
+    assert f"persona={persona.value}" in caplog.text
+
+
+@pytest.mark.parametrize("token", ["bogus", "orson", "atten", "crikey"])
+def test_persona_command_with_an_unknown_token_replies_usage_and_logs(token, caplog):
+    client = UClient()
+    interviewer, _ = _interviewer_store()
+    gateway = Gateway(client, interviewer=interviewer)
+
+    gateway._dispatch(_text_update(1, 101, f"/persona {token}"))
+
+    assert client.sent_text == [(101, PERSONA_REPLY_USAGE)]
+    assert 101 not in gateway._personas, "a bad token can never enter state"
+    assert "event=persona_unknown_reply" in caplog.text
+
+
+def test_persona_command_with_an_at_bot_suffix_still_switches():
+    client = UClient()
+    interviewer, _ = _interviewer_store()
+    gateway = Gateway(client, interviewer=interviewer)
+
+    gateway._dispatch(_text_update(1, 101, "/persona@MyBot irwin"))
+
+    assert client.sent_text == [(101, PERSONA_REPLY_CONFIRMED_IRWIN)]
+    assert gateway._personas[101] is Persona.IRWIN
+
+
+def test_persona_command_is_safe_during_interviewing_and_does_not_touch_state():
+    client = UClient()
+    interviewer, store = _interviewer_store()
+    interviewer.start(101)  # INTERVIEWING
+    answers_before = store.get(101).answers
+    gateway = Gateway(client, interviewer=interviewer)
+
+    gateway._dispatch(_text_update(1, 101, "/persona irwin"))
+
+    assert gateway._personas[101] is Persona.IRWIN
+    assert store.get(101).phase is InterviewPhase.INTERVIEWING
+    assert store.get(101).answers == answers_before
+    assert client.sent_text == [(101, PERSONA_REPLY_CONFIRMED_IRWIN)]
+
+
+def test_persona_command_works_without_an_interviewer():
+    client = UClient()
+    gateway = Gateway(client)  # Phase-1 mode: no interviewer wired
+
+    gateway._dispatch(_text_update(1, 101, "/persona irwin"))
+
+    assert client.sent_text == [(101, PERSONA_REPLY_CONFIRMED_IRWIN)]
+    assert gateway._personas[101] is Persona.IRWIN
+
+
+def test_persona_persists_across_restart_and_start():
+    client = UClient()
+    interviewer, store = _interviewer_store()
+    gateway = Gateway(client, interviewer=interviewer)
+
+    gateway._dispatch(_text_update(1, 101, "/persona irwin"))
+    gateway._dispatch(_text_update(2, 101, "/restart"))
+    gateway._dispatch(_text_update(3, 101, "/start"))
+
+    assert gateway._personas[101] is Persona.IRWIN, (
+        "a persona is a preference, not conversation memory"
+    )
+    assert store.get(101).phase is InterviewPhase.IDLE
+
+
+def test_persona_is_isolated_per_chat():
+    client = UClient()
+    interviewer, _ = _interviewer_store()
+    gateway = Gateway(client, interviewer=interviewer)
+
+    gateway._dispatch(_text_update(1, 101, "/persona irwin"))
+
+    assert gateway._resolve_persona(101) is Persona.IRWIN
+    assert gateway._resolve_persona(202) is Persona.ATTENBOROUGH
+
+
+def test_resolve_persona_falls_back_to_the_env_default(monkeypatch, caplog):
+    monkeypatch.setenv("PERSONA_DEFAULT", "irwin")
+    client = UClient()
+    gateway = Gateway(client)
+
+    assert gateway._resolve_persona(999) is Persona.IRWIN
+    assert "event=persona_resolved" in caplog.text
+
+
+def test_resolve_persona_prefers_the_stored_chat_choice(monkeypatch):
+    monkeypatch.setenv("PERSONA_DEFAULT", "attenborough")
+    client = UClient()
+    gateway = Gateway(client)
+    gateway._personas[101] = Persona.IRWIN
+
+    assert gateway._resolve_persona(101) is Persona.IRWIN
+
+
+def test_persona_reply_copy_is_locked():
+    assert PERSONA_REPLY_USAGE == (
+        "pick a presenter: /persona attenborough or /persona irwin"
+    )
+    assert PERSONA_REPLY_CONFIRMED_ATTENBOROUGH == (
+        "Right then — Sir David it is: posh British documentary narration, coming up."
+    )
+    assert PERSONA_REPLY_CONFIRMED_IRWIN == (
+        "Crikey! The wildlife warrior is in — get ready for some Aussie energy."
+    )
+
+
+# --- unknown-command hardening (Phase 8) ----------------------------------------
+
+
+def test_unknown_command_reply_copy_is_locked():
+    assert GATEWAY_REPLY_UNKNOWN_COMMAND == (
+        "hmm, I don't know that one — try /start, /restart or /persona"
+    )
+
+
+@pytest.mark.parametrize("command", ["/foo", "/help", "/Wibble", "/personas"])
+def test_unknown_command_at_idle_gets_the_unknown_reply_not_a_photo_prompt(
+    command, caplog
+):
+    client = UClient()
+    interviewer, _ = _interviewer_store()
+    gateway = Gateway(client, interviewer=interviewer)
+
+    gateway._dispatch(_text_update(1, 101, command))
+
+    assert client.sent_text == [(101, GATEWAY_REPLY_UNKNOWN_COMMAND)]
+    assert "event=unknown_command" in caplog.text
+
+
+def test_unknown_command_during_interviewing_is_never_stored_as_an_answer():
+    client = UClient()
+    interviewer, store = _interviewer_store()
+    interviewer.start(101)
+    before = store.get(101)
+    gateway = Gateway(client, interviewer=interviewer)
+
+    gateway._dispatch(_text_update(1, 101, "/foo"))
+
+    after = store.get(101)
+    assert client.sent_text == [(101, GATEWAY_REPLY_UNKNOWN_COMMAND)]
+    assert after.phase is InterviewPhase.INTERVIEWING
+    assert after.question_index == before.question_index
+    assert after.answers == before.answers, "an unknown command is not an answer"
+
+
+def test_unknown_command_at_complete_gets_the_unknown_reply():
+    client = UClient()
+    store = _complete_store(101)
+    gateway = Gateway(client, interviewer=Interviewer(api_key=None, store=store))
+
+    gateway._dispatch(_text_update(1, 101, "/foo"))
+
+    assert client.sent_text == [(101, GATEWAY_REPLY_UNKNOWN_COMMAND)]
+
+
+def test_unknown_command_works_without_an_interviewer():
+    client = UClient()
+    gateway = Gateway(client)
+
+    gateway._dispatch(_text_update(1, 101, "/foo"))
+
+    assert client.sent_text == [(101, GATEWAY_REPLY_UNKNOWN_COMMAND)]
+
+
+def test_command_matching_is_token_based_not_prefix_based():
+    """A command-like prefix (`/startle`) is an unknown command, not a reset —
+    and, crucially, is never slurped as an interview answer."""
+    client = UClient()
+    interviewer, _ = _interviewer_store()
+    gateway = Gateway(client, interviewer=interviewer)
+
+    gateway._dispatch(_text_update(1, 101, "/startle"))
+
+    assert client.sent_text == [(101, GATEWAY_REPLY_UNKNOWN_COMMAND)]
+
+
+def test_start_command_with_an_at_bot_suffix_still_resets():
+    client = UClient()
+    interviewer, store = _interviewer_store()
+    interviewer.start(101)
+    gateway = Gateway(client, interviewer=interviewer)
+
+    gateway._dispatch(_text_update(1, 101, "/start@MyBot"))
+
+    assert (101, INTERVIEWER_REPLY_RESET) in client.sent_text
+    assert store.get(101).phase is InterviewPhase.IDLE
+
+
+def test_non_command_text_still_routes_by_phase():
+    """Regression: ordinary text is untouched by the command guard."""
+    client = UClient()
+    interviewer, _ = _interviewer_store()
+    gateway = Gateway(client, interviewer=interviewer)
+
+    gateway._dispatch(_text_update(1, 101, "hello there"))
+
+    assert client.sent_text == [(101, GATEWAY_REPLY_NEED_PHOTO)]

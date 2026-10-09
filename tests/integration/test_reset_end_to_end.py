@@ -89,7 +89,7 @@ class FakeScripter:
         self._store = store
         self.resets: list[int] = []
 
-    def write_script(self, chat_id: int, profile) -> str:
+    def write_script(self, chat_id: int, profile, persona=None) -> str:
         state = self._store.get(chat_id)
         self._store.save(
             chat_id,
@@ -105,7 +105,7 @@ class FakeNarrator:
     def __init__(self) -> None:
         self.synthesize_calls: list[int] = []
 
-    def synthesize(self, chat_id: int, script: str) -> bytes:
+    def synthesize(self, chat_id: int, script: str, persona=None) -> bytes:
         self.synthesize_calls.append(chat_id)
         return b"O" * 256  # a plausible OGG payload
 
