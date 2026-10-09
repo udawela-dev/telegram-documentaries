@@ -39,7 +39,13 @@ No webhook mode, no database, no cache layer, no extra services.
   unpreventable `finally`-cleanup on success and error; a non-voice-note
   format is converted to OGG/Opus via an ffmpeg seam (`-f ogg` forced before
   the output path; missing ffmpeg when conversion is needed → loud
-  `NarratorError`). **Deliberately no local/fake TTS fallback**: any failure
+  `NarratorError`). The seam's input format is decided from the response
+  **mime**, not the bytes (2026-10-09, live-verified): the TTS model returns
+  headerless LINEAR16 PCM (`audio/L16;codec=pcm;rate=24000`, mono s16le), so a
+  declared LINEAR16 mime stages `.pcm` + explicit `-f s16le -ar <rate> -ac 1`;
+  RIFF/WAVE stages `.wav` and is probed; anything else stages an opaque `.tmp`
+  probed by content so an unknown format fails loudly instead of being
+  force-decoded as PCM. **Deliberately no local/fake TTS fallback**: any failure
   degrades to the locked `NARRATOR_REPLY_UNAVAILABLE` — audio quality is never
   faked. Delivery via `send_voice`; a send failure logs
   `event=narrator_send_failed` loudly with no unavailable reply (the note may
