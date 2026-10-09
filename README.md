@@ -3,7 +3,8 @@
 Send a portrait to a Telegram bot and receive a narrated, comedy-wildlife
 documentary about yourself.
 
-**Current state: Phases 1 + 2 + 3 + 4 + 5 + 6.**
+**Current state: Phases 1–8.** (gateway → Bouncer → Interviewer → Converter →
+Scripter → Narrator → resilience & polish → presenter personas)
 
 - **Phase 1 — the gateway.** A long-polling loop (`src/gateway.py`) that
   replies to text messages with `"Hi Mate"`.
@@ -72,6 +73,18 @@ documentary about yourself.
   non-photo media is routed by phase, duplicate updates in one batch apply
   once, and every degraded Gemini reply is followed by a retry hint
   (`try again, or type /restart`).
+- **Phase 8 — Presenter personas.** (`feature/2026-10-09-presenter-personas`):
+  two presenters, selectable **per chat** with `/persona attenborough` (posh
+  British, the default) or `/persona irwin` ("Crikey!" energy). The choice is
+  in-memory, survives `/restart`, and colours exactly two stages — the
+  **Scripter** (tone: attenborough = today's deep posh-British paragraph,
+  irwin = "Crikey!"-flavoured opener) and the **Narrator** (distinct prebuilt
+  TTS voice per persona: `NARRATOR_VOICE` for attenborough, `NARRATOR_VOICE_IRWIN`
+  for irwin, default `Charon`; both driven by real Gemini TTS). Bouncer and
+  Interviewer copy stays locked; all persona copy lives in `src/persona.py`
+  (the single owner, wired into gateway/scripter/narrator). An unknown
+  `/command` at any phase gets the locked unknown-command reply and is never
+  stored as an interview answer nor does it advance the interview.
 
 ## Setup
 
@@ -131,7 +144,14 @@ Optional Narrator tuning:
 | ------------------------ | --------------------------- | ------------ |
 | `NARRATOR_MODEL`         | `gemini-3.1-flash-tts-preview` | Gemini TTS model for the voice note (direct API call, not an agent). |
 | `NARRATOR_VOICE`         | `Orus`                  | Prebuilt Gemini TTS voice (firm/low-register male). |
+| `NARRATOR_VOICE_IRWIN`   | `Charon`                | Prebuilt Gemini TTS voice for the `irwin` persona. |
 | `NARRATOR_GEMINI_TIMEOUT`| `60`                        | Seconds a TTS synthesis may take before it is abandoned (graceful unavailable — there is no local TTS fallback). |
+
+Optional presenter tuning (Phase 8):
+
+| Variable          | Default        | What it does |
+| ----------------- | -------------- | ------------ |
+| `PERSONA_DEFAULT` | `attenborough` | The presenter for chats that have never run `/persona` (invalid/blank value logs `event=persona_default_invalid` and falls back to `attenborough`). |
 
 Never commit `.env` — it is gitignored. Both secrets are scrubbed from every
 log record by a redaction filter (`src/logging_utils.py`); the httpx/httpcore
@@ -154,6 +174,8 @@ Behaviour:
 | Text after the interview | Re-sends the stored profile + suggested animal |
 | Photo while an interview is running (or after completion) | `please answer the current question with text, or type /restart` — the gate is **never** re-run and no state is touched |
 | `/start` or `/restart` | Wipes the chat's Bouncer, Interviewer, Converter **and Scripter** sessions, purges the stored portrait + all registered temp files — instant reset from any phase, no confirmation, then invites a fresh photo (dispatch is strictly sequential, so the reset always lands cleanly at the next free step) |
+| `/persona attenborough` or `/persona irwin` | Picks that chat's presenter (per-chat, in-memory, survives `/restart`): `attenborough` = today's posh-British narrator; `irwin` = "Crikey!"-flavoured script **and** a distinct real TTS voice (`Charon`). Confirmations and usage copy are locked (`/persona` alone prints the usage) |
+| Any other `/command` (e.g. `/pizza`) | `unknown command` — the locked reply at **every** phase; it is never stored as an interview answer and the interview position never moves |
 | Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` then **`Non-human detected`** (rejected + Bouncer session, Interviewer state, stored portrait and Converter session all reset; a rejection only happens while idle) |
 | Photo when Gemini is unreachable | **Local fallback verdict**, labelled as offline: face detected → **`Human detected ✓ (offline face check)`**; no face → **`Non-human detected (offline face check)`**. The local detector only finds faces, so an animal can pass this weak gate (the real discriminator is Gemini). (Only if the local detector fails too does the graceful "Hang on…" reply appear.) |
 
@@ -216,7 +238,7 @@ Stop it with `Ctrl-C` (SIGINT) or SIGTERM — it shuts down gracefully.
 Live Gemini verification is **opt-in** (offline suite never requires a key):
 
 ```bash
-RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py tests/integration/test_live_converter.py tests/integration/test_live_scripter.py tests/integration/test_live_narrator.py -v
+RUN_LIVE_GEMINI=1 python3 -m pytest tests/integration/test_live_bouncer.py tests/integration/test_live_converter.py tests/integration/test_live_scripter.py tests/integration/test_live_narrator.py tests/integration/test_live_personas.py -v
 ```
 
 It classifies committed fixtures (`tests/fixtures/person.jpg` — expect
@@ -243,7 +265,10 @@ and `src/local_composite.py` (key-free photo-booth fallback) →
 `src/scripter.py` (ADK text agent on `gemini-3.1-flash-lite`, one 60–90 word
 documentary paragraph, `validate_script` shape gate, per-call fresh + reaped
 sessions) with `src/local_script.py` (key-free deterministic writer) →
-`src/narrator.py` (**direct** `gemini-3.1-flash-tts-preview` call — not an
+`src/persona.py` (Phase 8 single owner of presenter copy — typed `Persona`,
+script tones, per-persona TTS voices/instructions — wired into the gateway's
+`/persona` command, the Scripter and the Narrator) → `src/narrator.py`
+(**direct** `gemini-3.1-flash-tts-preview` call — not an
 agent — voice note via `send_voice`; temp-file lifecycle with
 `finally`-cleanup; ffmpeg OGG/Opus conversion seam when needed; no local TTS
 fallback).

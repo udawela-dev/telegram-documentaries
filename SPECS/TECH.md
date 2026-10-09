@@ -97,6 +97,42 @@ No webhook mode, no database, no cache layer, no extra services.
   and no misleading apology is sent. Sessions are per-call fresh and reaped
   (same rule as the Converter).
 
+## Presenter personas (Phase 8)
+
+- **Two presenters, selectable per chat:** `attenborough` (posh British, the
+  default) and `irwin` ("Crikey!" energy). `src/persona.py` is the **single
+  owner of persona copy** (stdlib-only — imported by `src/narrator.py` without
+  a circular import): the typed `Persona` enum, script-tone snippets, per-persona
+  prebuilt TTS voices and narrator instructions, and the local-writer openers.
+  Everything reads from it; nothing hardcodes persona strings elsewhere.
+- **Selection and dispatch:** `/persona <token>` sets the chat's choice
+  (in-memory store inside the Gateway); `/persona` alone → locked usage;
+  unknown token → locked usage + `event=persona_unknown_reply`. The choice is
+  resolved **at dispatch time** (`_resolve_persona`): stored choice wins,
+  else `PERSONA_DEFAULT` env, else `attenborough` (invalid env → loud
+  `event=persona_default_invalid` + fallback, never a crash). The store is
+  **never cleared by resets** — the persona survives `/restart`/`/start`.
+- **The persona colours exactly two stages** (Bouncer/Interviewer copy stays
+  locked, user decision 2):
+  - **Scripter** — `write_script(chat_id, profile, persona)`; the tone snippet
+    is prepended to the model instruction (`persona_instruction`), and
+    `LocalScriptWriter` gets the opener. Attenborough's opener is empty →
+    a persona-less Phase 7 run is **byte-for-byte identical** (env absent =
+    no env, unit-locked).
+  - **Narrator** — `synthesize(chat_id, script, persona)`; the prebuilt voice
+    (`resolve_persona_voice`: `NARRATOR_VOICE` → default `Orus` for
+    attenborough, `NARRATOR_VOICE_IRWIN` → default `Charon` for irwin) and the
+    style instruction are applied **per call**: set before the TTS worker
+    starts, cleared in the same `finally` that reaps temp files, so the worker
+    only ever sees this call's voice. Free-text personas are a typed `TypeError`
+    boundary at both stages.
+- **Unknown-command hardening (user decision 4):** any `/word` outside
+  `_KNOWN_COMMANDS = {"/start", "/restart", "/persona"}` gets the locked
+  `GATEWAY_REPLY_UNKNOWN_COMMAND` reply **at every phase** — handled before
+  the interview-phase read, so it is never stored as an interview answer and
+  the interview position never moves (unit- and component-locked). Matching is
+  token-based (`_command_name`), so `/startle` is unknown, not a reset.
+
 ## Contracts at boundaries
 
 - Parse Telegram updates, Gemini responses, and TTS output into **typed Pydantic

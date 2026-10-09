@@ -10,6 +10,12 @@ The output is a single 60–90 word paragraph grounded in the profile's
 ``suggested_animal`` and a locked narrative template. Identical input yields
 identical output; the Scripter's :func:`validate_script` still gates it, so a
 shape violation here can never be silently accepted.
+
+Phase 8 makes the writer persona-aware: the tone is expressed by a locked
+persona opener (:data:`src.persona.PERSONA_LOCAL_OPENER`) prepended to the same
+template. ``attenborough``'s opener is ``""``, so Phase 7 output is
+byte-for-byte unchanged; ``irwin``'s ``"Crikey! "`` keeps the worst-case
+canonical animal at 84 words — comfortably inside the unchanged 60–90 budget.
 """
 
 from __future__ import annotations
@@ -17,6 +23,7 @@ from __future__ import annotations
 import logging
 
 from src.interview_state import UserProfile
+from src.persona import PERSONA_LOCAL_OPENER, Persona
 
 logger = logging.getLogger(__name__)
 
@@ -40,11 +47,24 @@ class LocalScriptWriter:
     def __init__(self) -> None:
         logger.info("event=local_script_ready")
 
-    def write(self, profile: UserProfile) -> str:
-        """Return a deterministic single-paragraph narration for ``profile``."""
+    def write(
+        self, profile: UserProfile, persona: Persona = Persona.ATTENBOROUGH
+    ) -> str:
+        """Return a deterministic single-paragraph narration for ``profile``.
+
+        ``persona`` colours the tone via the locked opener; anything that is
+        not a typed :class:`~src.persona.Persona` is rejected (the Scripter
+        resolves the persona at the edge, never free text).
+        """
+        if not isinstance(persona, Persona):
+            raise TypeError(f"unknown persona: {persona!r}")
         animal = profile.suggested_animal
-        script = TEMPLATE.format(animal=animal)
+        script = PERSONA_LOCAL_OPENER[persona] + TEMPLATE.format(animal=animal)
         logger.info(
-            "event=local_script_done animal=%s words=%d", animal, len(script.split())
+            "event=local_script_done animal=%s persona=%s words=%d",
+            animal,
+            persona.value,
+            len(script.split()),
         )
         return script
+

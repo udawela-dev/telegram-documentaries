@@ -43,6 +43,12 @@ from src.narrator import (
     resolve_narrator_timeout,
     resolve_narrator_voice,
 )
+from src.persona import (
+    PERSONA_NARRATOR_INSTRUCTION,
+    PERSONA_NARRATOR_VOICE,
+    Persona,
+    resolve_persona_voice,
+)
 
 SCRIPT = "The sun rises over the savannah, and our subject stirs."
 
@@ -112,6 +118,23 @@ class HangingNarrator(Narrator):
     def _run_tts(self, script: str) -> tuple[bytes, str | None]:
         time.sleep(1.0)
         return OGG_BYTES, "audio/ogg"
+
+
+class PersonaRecordingNarrator(ScriptedNarrator):
+    """Records the voice id + request text the seam actually used for a run."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.seen_voices: list[str] = []
+        self.seen_requests: list[str] = []
+
+    def _run_tts(self, script: str) -> tuple[bytes, str | None]:
+        self.seen_requests.append(self._request_text(script))
+        config = self._build_config()
+        self.seen_voices.append(
+            config.speech_config.voice_config.prebuilt_voice_config.voice_name
+        )
+        return self.audio, self.mime
 
 
 # --- fakes for the direct genai call --------------------------------------------
@@ -815,6 +838,129 @@ def test_constructor_honours_explicit_model_and_voice():
 
     assert narrator.model == "gemini-custom-tts"
     assert narrator.voice == "Puck"
+
+
+# --- persona voice + instruction (Phase 8) --------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _clean_persona_voice_env(monkeypatch):
+    """Persona voice resolution must not inherit a developer's host exports."""
+    monkeypatch.delenv("NARRATOR_VOICE", raising=False)
+    monkeypatch.delenv("NARRATOR_VOICE_IRWIN", raising=False)
+
+
+@pytest.mark.parametrize("persona", list(Persona))
+def test_synthesize_uses_the_persona_voice_and_instruction(persona):
+    narrator = PersonaRecordingNarrator()
+
+    audio = narrator.synthesize(30, SCRIPT, persona)
+
+    assert audio == OGG_BYTES
+    assert narrator.seen_voices == [resolve_persona_voice(persona)]
+    request = narrator.seen_requests[0]
+    assert request.startswith(PERSONA_NARRATOR_INSTRUCTION[persona])
+    assert SCRIPT in request
+
+
+def test_synthesize_defaults_to_the_attenborough_voice_and_instruction():
+    """Backward compatibility by construction: no persona == exactly Phase 6."""
+    narrator = PersonaRecordingNarrator()
+
+    narrator.synthesize(31, SCRIPT)
+
+    assert narrator.seen_voices == [DEFAULT_NARRATOR_VOICE]
+    assert narrator.seen_requests[0].startswith(NARRATOR_PERSONA)
+
+
+def test_synthesize_attenborough_voice_is_the_phase6_default():
+    narrator = PersonaRecordingNarrator()
+
+    narrator.synthesize(32, SCRIPT, Persona.ATTENBOROUGH)
+
+    assert narrator.seen_voices == [resolve_narrator_voice()]
+
+
+def test_synthesize_irwin_uses_a_different_voice_than_attenborough():
+    narrator = PersonaRecordingNarrator()
+
+    narrator.synthesize(33, SCRIPT, Persona.ATTENBOROUGH)
+    narrator.synthesize(34, SCRIPT, Persona.IRWIN)
+
+    assert narrator.seen_voices[0] != narrator.seen_voices[1], (
+        "the two personas must sound different"
+    )
+    assert narrator.seen_voices[1] == PERSONA_NARRATOR_VOICE[Persona.IRWIN]
+
+
+def test_synthesize_persona_voice_is_resolved_at_call_time(monkeypatch):
+    narrator = PersonaRecordingNarrator()
+
+    narrator.synthesize(35, SCRIPT, Persona.IRWIN)
+    monkeypatch.setenv("NARRATOR_VOICE_IRWIN", "Aoife")
+    narrator.synthesize(36, SCRIPT, Persona.IRWIN)
+
+    assert narrator.seen_voices == ["Charon", "Aoife"]
+
+
+def test_synthesize_persona_does_not_mutate_the_constructor_voice():
+    narrator = PersonaRecordingNarrator(voice="Puck")
+
+    narrator.synthesize(37, SCRIPT, Persona.IRWIN)
+
+    assert narrator.seen_voices == [resolve_persona_voice(Persona.IRWIN)]
+    assert narrator.voice == "Puck", "the constructor voice must stay intact"
+
+
+def test_synthesize_clears_the_persona_context_after_the_call():
+    """No persona leaks into a later direct TTS call on the same instance."""
+    narrator = PersonaRecordingNarrator()
+
+    narrator.synthesize(38, SCRIPT, Persona.IRWIN)
+    narrator._run_tts(SCRIPT)  # direct call — must be back on the defaults
+
+    assert narrator.seen_voices[0] == resolve_persona_voice(Persona.IRWIN)
+    assert narrator.seen_voices[1] == DEFAULT_NARRATOR_VOICE
+    assert narrator.seen_requests[1].startswith(NARRATOR_PERSONA)
+
+
+def test_synthesize_clears_the_persona_context_even_when_tts_fails():
+    narrator = FailingNarrator()
+
+    with pytest.raises(NarratorError):
+        narrator.synthesize(39, SCRIPT, Persona.IRWIN)
+
+    assert narrator._active_voice is None
+    assert narrator._active_instruction is None
+
+
+def test_synthesize_rejects_a_free_text_persona():
+    narrator = ScriptedNarrator()
+
+    with pytest.raises(NarratorError):
+        narrator.synthesize(40, SCRIPT, "irwin")  # type: ignore[arg-type]
+
+
+def test_direct_run_tts_uses_the_phase6_defaults_without_a_persona_call():
+    """A direct seam call (no synthesize) reproduces Phase 6 exactly."""
+    client = FakeClient(_response_with_audio(OGG_BYTES))
+
+    class CapturingNarrator(Narrator):
+        def _run_tts(self, script):
+            content = self._request_text(script)
+            config = self._build_config()
+            self.captured = (
+                content,
+                config.speech_config.voice_config.prebuilt_voice_config.voice_name,
+            )
+            return OGG_BYTES, "audio/ogg"
+
+    narrator = CapturingNarrator(client=client)
+    narrator._run_tts(SCRIPT)
+
+    content, voice = narrator.captured
+    assert voice == DEFAULT_NARRATOR_VOICE
+    assert content.startswith(NARRATOR_PERSONA)
 
 
 # --- "The Narrator is not an agent" (source lock) -------------------------------

@@ -71,6 +71,7 @@ from src.converter import CONVERTER_REPLY_UNAVAILABLE
 from src.interview_state import InterviewPhase
 from src.interviewer import INTERVIEWER_REPLY_RESET, INTERVIEWER_REPLY_UNAVAILABLE
 from src.narrator import NARRATOR_REPLY_UNAVAILABLE
+from src.persona import Persona, parse_persona, resolve_default_persona
 from src.scripter import SCRIPTER_REPLY_UNAVAILABLE
 from src.telegram_models import Message, TelegramAPIError, Update
 from src.temp_assets import TempAssets
@@ -82,6 +83,45 @@ REPLY_TEXT = "Hi Mate"
 GATEWAY_REPLY_PHOTO_DURING_INTERVIEW = "please answer the current question with text, or type /restart"
 GATEWAY_REPLY_NEED_PHOTO = "upload a clear portrait photo"
 GATEWAY_REPLY_RETRY_HINT = "try again, or type /restart"
+
+# Locked Phase 8 persona copy (commands + confirmations + unknown-command reply).
+PERSONA_REPLY_USAGE = "pick a presenter: /persona attenborough or /persona irwin"
+PERSONA_REPLY_CONFIRMED_ATTENBOROUGH = (
+    "Right then — Sir David it is: posh British documentary narration, coming up."
+)
+PERSONA_REPLY_CONFIRMED_IRWIN = (
+    "Crikey! The wildlife warrior is in — get ready for some Aussie energy."
+)
+GATEWAY_REPLY_UNKNOWN_COMMAND = (
+    "hmm, I don't know that one — try /start, /restart or /persona"
+)
+
+# Persona → locked confirmation copy (single mapping, no branching in the handler).
+PERSONA_REPLY_CONFIRMED: dict[Persona, str] = {
+    Persona.ATTENBOROUGH: PERSONA_REPLY_CONFIRMED_ATTENBOROUGH,
+    Persona.IRWIN: PERSONA_REPLY_CONFIRMED_IRWIN,
+}
+
+# The commands the gateway answers directly; anything else starting with "/" is
+# an unknown command (Phase 8 hardening).
+_KNOWN_COMMANDS = frozenset({"/start", "/restart", "/persona"})
+
+
+def _command_name(text: str) -> tuple[str, str | None]:
+    """Return ``(command, first_arg_or_None)`` for a text message.
+
+    A command is the first whitespace-delimited token when it starts with
+    ``/``; a Telegram ``@botname`` suffix is stripped (``/start@MyBot`` →
+    ``/start``) so the token still routes. Non-command text yields ``("", None)``.
+    """
+    if not isinstance(text, str):
+        return "", None
+    parts = text.strip().split()
+    if not parts or not parts[0].startswith("/"):
+        return "", None
+    command = parts[0].split("@", 1)[0].lower()
+    arg = parts[1] if len(parts) > 1 else None
+    return command, arg
 
 
 class Gateway:
@@ -114,6 +154,10 @@ class Gateway:
         # Phase 6: the narrator. When None, completion is exactly Phases 1-5
         # (no voice note).
         self._narrator = narrator
+        # Phase 8: in-memory per-chat presenter persona (a preference, NOT
+        # conversation memory). Never cleared by /start or /restart; a chat with
+        # no entry resolves through PERSONA_DEFAULT at call time.
+        self._personas: dict[int, Persona] = {}
         self._temp_assets = temp_assets or TempAssets()
         self._reply_text = reply_text
         self._poll_timeout = poll_timeout
@@ -258,19 +302,33 @@ class Gateway:
         return self._handle_media(update.message, chat_id, update.update_id)
 
     def _handle_text(self, message: Message, chat_id: int, update_id: int) -> bool:
-        """Route a text message by interview phase (Phase 3).
+        """Route a text message by command first, then interview phase.
 
-        Without an interviewer this is exactly Phase 1: every text — including
-        ``/start`` / ``/restart`` — gets the confirmation reply. With an
-        interviewer, commands reset both stages, otherwise the reply depends on
-        the chat's interview phase.
+        Commands are matched on the first token (Telegram ``@botname`` suffix
+        stripped): ``/persona`` (gateway-owned, works at any phase), then
+        ``/start`` / ``/restart`` (reset), then any other ``/word`` → the locked
+        unknown-command reply. A reset/unknown command is handled before any
+        interview-phase read, so a command can never be stored as an answer.
+
+        Ordinary (non-command) text: without an interviewer this is exactly
+        Phase 1 (the confirmation reply); with one, the reply depends on the
+        chat's interview phase.
         """
+        text = message.text or ""
+        command, arg = _command_name(text)
+
+        if command == "/persona":
+            return self._handle_persona_command(chat_id, arg, update_id)
+        if command in ("/start", "/restart"):
+            if self._interviewer is None:
+                # Phase-1 compatibility: a bare reset still just says "Hi Mate".
+                return self._reply_confirmation(chat_id, update_id)
+            return self._handle_reset_command(chat_id, update_id)
+        if command:
+            return self._handle_unknown_command(chat_id, command, update_id)
+
         if self._interviewer is None:
             return self._reply_confirmation(chat_id, update_id)
-
-        text = message.text or ""
-        if text.startswith(("/start", "/restart")):
-            return self._handle_reset_command(chat_id, update_id)
 
         try:
             state = self._interviewer.state(chat_id)
@@ -289,6 +347,74 @@ class Gateway:
         # IDLE (or any unknown phase): prompt for the portrait, not "Hi Mate".
         logger.info("event=idle_text_photo_prompt chat_id=%s update_id=%d", chat_id, update_id)
         self._client.send_message(chat_id, GATEWAY_REPLY_NEED_PHOTO)
+        return True
+
+    def _resolve_persona(self, chat_id: int) -> Persona:
+        """The chat's persona: its stored choice, else ``PERSONA_DEFAULT``.
+
+        Resolved at call time so a running deployment's ``PERSONA_DEFAULT``
+        override applies to chats that never ran ``/persona``.
+        """
+        persona = self._personas.get(chat_id)
+        if persona is None:
+            persona = resolve_default_persona()
+        logger.info(
+            "event=persona_resolved chat_id=%s persona=%s", chat_id, persona.value
+        )
+        return persona
+
+    def _handle_persona_command(
+        self, chat_id: int, arg: str | None, update_id: int
+    ) -> bool:
+        """``/persona [token]``: switch the chat's presenter. Never touches state.
+
+        Bare → usage; a valid typed token → store + confirmation
+        (``event=persona_set``); anything else → usage + ``persona_unknown_reply``
+        (a bad token never enters state).
+        """
+        if arg is None:
+            self._client.send_message(chat_id, PERSONA_REPLY_USAGE)
+            logger.info(
+                "event=persona_usage chat_id=%s update_id=%d", chat_id, update_id
+            )
+            return True
+
+        persona = parse_persona(arg)
+        if persona is None:
+            logger.warning(
+                "event=persona_unknown_reply chat_id=%s update_id=%d token=%r",
+                chat_id,
+                update_id,
+                arg,
+            )
+            self._client.send_message(chat_id, PERSONA_REPLY_USAGE)
+            return True
+
+        self._personas[chat_id] = persona
+        self._client.send_message(chat_id, PERSONA_REPLY_CONFIRMED[persona])
+        logger.info(
+            "event=persona_set chat_id=%s update_id=%d persona=%s",
+            chat_id,
+            update_id,
+            persona.value,
+        )
+        return True
+
+    def _handle_unknown_command(
+        self, chat_id: int, command: str, update_id: int
+    ) -> bool:
+        """Any other ``/word`` → the locked unknown-command reply, at every phase.
+
+        Handled before the interview-phase read, so an unknown command can never
+        be stored as an interview answer or mistaken for idle text.
+        """
+        logger.info(
+            "event=unknown_command chat_id=%s update_id=%d command=%s",
+            chat_id,
+            update_id,
+            command,
+        )
+        self._client.send_message(chat_id, GATEWAY_REPLY_UNKNOWN_COMMAND)
         return True
 
     def _reply_complete_phase(self, chat_id: int, update_id: int, state) -> bool:
@@ -462,8 +588,9 @@ class Gateway:
         logger.info(
             "event=scripter_started chat_id=%s update_id=%d", chat_id, update_id
         )
+        persona = self._resolve_persona(chat_id)
         try:
-            script = self._scripter.write_script(chat_id, profile)
+            script = self._scripter.write_script(chat_id, profile, persona)
         except Exception:
             logger.exception(
                 "event=script_failed chat_id=%s update_id=%d stage=write_script",
@@ -491,7 +618,7 @@ class Gateway:
         # Phase 6: after the script text (the third message) render + deliver the
         # voice note (the fourth message). The narration reads the script the
         # Scripter stored on the shared driver.
-        self._handle_narration(chat_id, update_id)
+        self._handle_narration(chat_id, update_id, persona)
 
     def _read_stored_script(self, chat_id: int, update_id: int) -> str | None:
         """Read ``state.script`` from the shared driver (Phase 5 hand-off).
@@ -517,7 +644,9 @@ class Gateway:
             )
             return None
 
-    def _handle_narration(self, chat_id: int, update_id: int) -> None:
+    def _handle_narration(
+        self, chat_id: int, update_id: int, persona: Persona | None = None
+    ) -> None:
         """Render + send the voice note after the script text (Phase 6).
 
         Inactive when no narrator is wired — exactly Phases 1-5. Missing script →
@@ -528,9 +657,15 @@ class Gateway:
         loud ``narrator_send_failed`` log and NO apology (the script was produced
         and stays on state; TTS may have succeeded, so the apology would
         mislead). The polling loop always survives.
+
+        ``persona`` selects the voice/style; when omitted it resolves from the
+        chat's stored choice (or ``PERSONA_DEFAULT``).
         """
         if self._narrator is None:
             return  # Phases-1-5 regression: no narrator, no extra replies/events
+
+        if persona is None:
+            persona = self._resolve_persona(chat_id)
 
         script = self._read_stored_script(chat_id, update_id)
         if not script:
@@ -547,7 +682,7 @@ class Gateway:
             "event=narrator_started chat_id=%s update_id=%d", chat_id, update_id
         )
         try:
-            audio = self._narrator.synthesize(chat_id, script)
+            audio = self._narrator.synthesize(chat_id, script, persona)
         except Exception:
             logger.exception(
                 "event=narrator_failed chat_id=%s update_id=%d stage=synthesize",

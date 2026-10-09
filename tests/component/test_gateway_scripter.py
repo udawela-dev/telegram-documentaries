@@ -127,7 +127,7 @@ class FakeScripter(Scripter):
         self.calls: list[tuple] = []  # (chat_id, profile) per write_script call
         self.llm_calls: list[str] = []
 
-    def write_script(self, chat_id: int, profile) -> str:
+    def write_script(self, chat_id: int, profile, persona=None) -> str:
         self.calls.append((chat_id, profile))
         return super().write_script(chat_id, profile)
 

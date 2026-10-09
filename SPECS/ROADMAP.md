@@ -155,3 +155,46 @@ logging/error policy from `TECH.md` applied throughout.
 corrupts state; a Gemini timeout degrades gracefully with a logged, human-readable
 message instead of a crash.
 **Rubric:** reset behaviour and robustness under misuse.
+
+---
+
+### 8. Presenter personas + unknown-command hardening
+
+**Implemented** (`feature/2026-10-09-presenter-personas`): exactly two
+presenters — `attenborough` (posh British, the default) and `irwin`
+("Crikey!" energy) — selectable **per chat** with `/persona` and resolved at
+dispatch time (`PERSONA_DEFAULT` env for untouched chats; invalid value →
+`event=persona_default_invalid` + fallback, never a crash). The choice is
+in-memory and **survives `/restart`/`/start`** (resets never clear it) and
+colours precisely two stages: the **Scripter** (`write_script(..., persona)`:
+tone prepended to the model instruction, `src/persona.py` — stdlib-only single
+owner of all persona copy — feeding `src/scripter.py` and
+`src/local_script.py`; attenborough opener is empty so Phase 7 output is
+byte-for-byte identical) and the **Narrator** (`synthesize(..., persona)`:
+distinct prebuilt TTS voice per persona, `NARRATOR_VOICE` / `NARRATOR_VOICE_IRWIN`
+env, irwin default `Charon`; per-call voice + instruction set before the worker
+starts and cleared in the dispose `finally`). Bouncer/Interviewer copy stays
+locked (user decision 2). Hardening rides along (user decision 4): any
+unknown `/command` at any phase → the locked `GATEWAY_REPLY_UNKNOWN_COMMAND`
+reply, never stored as an interview answer and the interview position never
+moves (`_command_name` is token-based so `/startle` can't fake a reset; the
+`/persona`-with-suffix form still works). Offline suite green (**557 passed,
+7 skipped** — the skips are guarded live-Gemini tests): unit
+(`tests/unit/test_persona.py`, plus persona/unknown-command cases in
+`tests/unit/test_gateway.py`, scripter/narrator/local-writer persona cases),
+component (`tests/component/test_gateway_personas.py`: irwin reaches scripter
++narrator on a full run, persona survives restart into a second run, two-chat
+isolation, bogus `/command` frozen-state contract) and guarded live
+(`tests/integration/test_live_personas.py`: the two personas resolve to
+different prebuilt voices and both produce byte-distinct real TTS voice notes
+— verified live).
+
+`/persona` per-chat presenter switch (survives reset), distinct per-presenter
+script tone **and** TTS voice, and a locked unknown-command reply at every
+phase.
+
+**Acceptance:** `/persona irwin` replaces the spoken voice and script tone for
+that chat only; the choice survives `/restart`; unknown commands are answered
+with the locked reply at every phase and never advance or pollute state.
+**Rubric:** user-facing personality/choice (creative liberty), robustness
+under misuse.

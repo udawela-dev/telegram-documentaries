@@ -64,7 +64,7 @@ class FakeNarrator:
         self.fail = fail
         self.calls: list[tuple[int, str]] = []
 
-    def synthesize(self, chat_id: int, script: str) -> bytes:
+    def synthesize(self, chat_id: int, script: str, persona=None) -> bytes:
         self.calls.append((chat_id, script))
         if self.fail:
             raise NarratorError("ffmpeg is not installed")
