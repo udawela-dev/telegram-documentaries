@@ -86,13 +86,21 @@
       `test_resolve_model_honours_env_override`.
 
 ## Live check (bot in Telegram) — needs user
-- [ ] (needs user's Telegram) Person photo → approved → 7 answers → profile
-      text, then the hybrid photo, then **the script text message arrives in
-      the same chat**, the bot logs `event=script_stored` (today:
-      `source=local`) with no `SCRIPTER_REPLY_UNAVAILABLE`, and the raw script
-      is stored in state for Phase 6. The real `gemini-3.1-flash-lite`
-      paragraph is exercised by the guarded live test the moment a healthy key
-      exists.
+- [x] (2026-10-09, log-verified in `/tmp/opencode/bot.log`) Person photo →
+      approved → 7 answers → profile text, then the hybrid photo, then the
+      script text message arrives in the same chat. Evidence (telegram
+      cycle at 01:36–01:40, chat 8815679590): `bouncer_local_verdict
+      human_present=True` → `photo_approved reason='local face detector found a
+      human face'` → `photo_verdict_sent verdict=human` → 7 answers →
+      `converter_local_fallback animal=the Dormouse bytes=97794` →
+      `hybrid_sent bytes=97794` → `scripter_started` →
+      `scripter_gemini_failed ... 403 ... fallback_local=True` →
+      `script_generated source=local` → `script_stored words=82`, with **no**
+      `script_send_failed` event afterwards (store-then-send delivered the
+      script text; success is not logged by design). Today the key-free local
+      writer produced the paragraph (403-blocked key); the real
+      `gemini-3.1-flash-lite` paragraph is exercised by the guarded live test
+      the moment a healthy key exists.
 - [ ] (needs user's Telegram) `/restart` after a completed run clears the stored
       script; a fresh cycle still works.
 - [ ] (needs user's Telegram) Non-human photo mid-interview → rejection +
