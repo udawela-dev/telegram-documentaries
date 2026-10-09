@@ -58,6 +58,20 @@ documentary about yourself.
   **No local/fake TTS fallback** (deliberate): when TTS cannot run the bot
   sends the locked `NARRATOR_REPLY_UNAVAILABLE` — audio quality is never
   faked.
+- **Phase 7 — Resilience & polish.** (`feature/2026-10-09-reset-hardening`):
+  `/start` and `/restart` are identical per-chat resets — instant, no
+  confirmation, from **any** phase — that purge the Bouncer/Interviewer/
+  Converter/**Scripter** sessions, the stored portrait, and **every temp asset
+  registered for that chat** (`src/temp_assets.py`). Stale results are
+  impossible **by construction**: dispatch is strictly sequential, so a reset
+  always lands at the next free step and a busy stage's workers can never
+  send late output. Wrong payloads are refused at the right
+  stage: a photo during the interview or after completion never re-runs the
+  gate (`please answer the current question with text, or type /restart`),
+  text while idle now prompts for a portrait instead of a bare "Hi Mate",
+  non-photo media is routed by phase, duplicate updates in one batch apply
+  once, and every degraded Gemini reply is followed by a retry hint
+  (`try again, or type /restart`).
 
 ## Setup
 
@@ -133,13 +147,14 @@ Behaviour:
 
 | You send | Bot replies |
 | -------- | --------- |
-| Text while idle (no interview running) | `Hi Mate` |
+| Text while idle (no interview running) | `upload a clear portrait photo` — the loop asks for the portrait (Phase 7; no bare "Hi Mate") |
 | Photo with a human | `Hi Mate` then **`Human detected ✓`**, then the interview's **Q1** (the interview starts) |
 | Text while interviewing | Exactly **one** next question — the answer is stored in order first |
 | 7th answer | Behavioural profile covering **Habits / Quirks / Routines / Preferences** plus **`Suggested animal: X`**, then a **hybrid portrait photo** of you as that animal, then the **scripted narration** — one dramatic 60–90 word paragraph about you — and finally a **voice note** of the narrator reading that paragraph (order: profile text → hybrid photo → script text → voice note) |
 | Text after the interview | Re-sends the stored profile + suggested animal |
-| `/start` or `/restart` | Wipes the chat's Bouncer session **and** Interviewer state, purges the stored portrait + Converter session, then invites a fresh photo |
-| Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` then **`Non-human detected`** (rejected + Bouncer session, Interviewer state, stored portrait and Converter session all reset) |
+| Photo while an interview is running (or after completion) | `please answer the current question with text, or type /restart` — the gate is **never** re-run and no state is touched |
+| `/start` or `/restart` | Wipes the chat's Bouncer, Interviewer, Converter **and Scripter** sessions, purges the stored portrait + all registered temp files — instant reset from any phase, no confirmation, then invites a fresh photo (dispatch is strictly sequential, so the reset always lands cleanly at the next free step) |
+| Photo without a human (animal/object/landscape) | `Oi! 📸 No monsters, no sunsets… Send me a picture of a person, mate.` then **`Non-human detected`** (rejected + Bouncer session, Interviewer state, stored portrait and Converter session all reset; a rejection only happens while idle) |
 | Photo when Gemini is unreachable | **Local fallback verdict**, labelled as offline: face detected → **`Human detected ✓ (offline face check)`**; no face → **`Non-human detected (offline face check)`**. The local detector only finds faces, so an animal can pass this weak gate (the real discriminator is Gemini). (Only if the local detector fails too does the graceful "Hang on…" reply appear.) |
 
 **The Interviewer state machine.** Interview progress lives on one shared

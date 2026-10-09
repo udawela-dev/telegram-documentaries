@@ -40,6 +40,7 @@ from typing import Any
 from google.genai import types as genai_types
 
 from src.logging_utils import redact
+from src.temp_assets import TempAssets
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,7 @@ class Narrator:
         voice: str | None = None,
         api_key: str | None = None,
         client=None,
+        temp_assets: TempAssets | None = None,
     ) -> None:
         # Make a settings-provided key visible to the genai client without ever
         # hardcoding it (mirrors Bouncer/Converter/Scripter).
@@ -153,6 +155,9 @@ class Narrator:
         # Inject honouring a test/production-supplied genai client. When absent
         # the client is built lazily on the first real TTS call.
         self._client = client
+        # Phase 7: the shared per-chat temp-asset registry (sweep-net so a reset
+        # can purge files staged by a worker that was interrupted mid-flight).
+        self._temp_assets = temp_assets
 
     @property
     def model(self) -> str:
@@ -437,7 +442,13 @@ class Narrator:
 
     @staticmethod
     def _cleanup_temp_paths(paths: list[str]) -> None:
-        """Unlink every staged temp path; a cleanup failure is logged, not hidden."""
+        """Unlink every staged temp path; a cleanup failure is logged, not hidden.
+
+        Registry entries intentionally stay after cleanup: the shared
+        TempAssets registry is the reset sweep-net (a later ``/restart`` purge
+        unlinks already-gone files as ``already_missing`` and logs it), so a
+        remove-on-cleanup would make the sweep invisible.
+        """
         for path in paths:
             try:
                 os.unlink(path)
@@ -445,6 +456,22 @@ class Narrator:
                 continue
             except OSError:
                 logger.exception("event=narrator_temp_cleanup_failed path=%s", path)
+
+    def _track_temp(self, chat_id: int, path: str) -> None:
+        """Register a staged temp file on the shared registry (Phase 7).
+
+        Tracking failures must never break synthesis — the registry is only the
+        sweep-net that a reset uses for files left by an interrupted worker; the
+        worker's own ``finally`` cleanup remains the primary path.
+        """
+        if self._temp_assets is None:
+            return
+        try:
+            self._temp_assets.track(chat_id, path)
+        except Exception:
+            logger.exception(
+                "event=narrator_temp_track_failed chat_id=%d path=%s", chat_id, path
+            )
 
     # --- public API -------------------------------------------------------------
 
@@ -483,9 +510,11 @@ class Narrator:
                 # opaque ``.tmp`` that ffmpeg probes by content.
                 suffix, input_args = self._source_format(audio, mime)
                 source = self._temp_path("narrator-source", temp_paths, suffix=suffix)
+                self._track_temp(chat_id, source)
                 # ``.ogg`` so ffmpeg can also infer the container from the name;
                 # the explicit ``-f ogg`` is the belt-and-braces (B1).
                 target = self._temp_path("narrator-ogg", temp_paths, suffix=".ogg")
+                self._track_temp(chat_id, target)
                 with open(source, "wb") as handle:
                     handle.write(audio)
                 self._convert_to_ogg(source, target, input_args=input_args)
@@ -495,6 +524,7 @@ class Narrator:
                     final = handle.read()
             else:
                 staged = self._temp_path("narrator-audio", temp_paths)
+                self._track_temp(chat_id, staged)
                 with open(staged, "wb") as handle:
                     handle.write(audio)
                 with open(staged, "rb") as handle:

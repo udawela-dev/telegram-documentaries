@@ -124,6 +124,29 @@ moment a healthy key exists.
 
 ### 7. Resilience & polish
 
+**Implemented** (`feature/2026-10-09-reset-hardening`): `/restart` and
+`/start` are identical, instant per-chat resets (no confirmation) that sweep
+the Bouncer/Interviewer/Converter/**Scripter** sessions, the stored portrait
+and **every registered temp asset** (`src/temp_assets.py`, wired through the
+shared Gateway + Narrator instance). Stale-task invalidation is **by
+construction**: dispatch is strictly sequential and every stage call blocks up
+to its timeout, so a reset lands at the next free step and stage timeout
+workers (daemons) can never send or write state — the originally planned epoch
+token is unreachable code in this architecture and was retired by user
+decision (`test_reset_queued_behind_a_stage_update_is_honoured...` locks the
+guarantee). Wrong payloads are refused by stage: photos mid-interview or after
+completion never re-run the gate
+(`GATEWAY_REPLY_PHOTO_DURING_INTERVIEW`), text at `IDLE` prompts for a
+portrait (`GATEWAY_REPLY_NEED_PHOTO`), non-photo media routes by phase
+(`event=media_no_photo`), duplicate updates in a batch apply once
+(`event=skip_duplicate_update`), and every degraded Gemini reply carries the
+locked retry hint (`GATEWAY_REPLY_RETRY_HINT`). Offline suite green (443
+passed, 5 skipped — guarded live-Gemini tests) including the new unit,
+component and integration tests (`tests/unit/test_gateway.py`,
+`tests/unit/test_temp_assets.py`, `tests/component/test_gateway_phase7.py`,
+`tests/integration/test_reset_end_to_end.py`: a full two-run cycle in one
+process with no stale output between runs).
+
 `/restart` and `/start` reset (purge state **and** temp files, process keeps
 running), wrong-payload-at-wrong-stage guards, API-timeout fallbacks, and the
 logging/error policy from `TECH.md` applied throughout.

@@ -5,21 +5,26 @@ test is real. Mirrors the phase-1 polling-loop tests' style.
 """
 import logging
 
-import pytest
-
 from src.bouncer import (
     BOUNCER_REJECTION,
     BOUNCER_UNAVAILABLE_REPLY,
-    BouncerDecision,
     HUMAN_VERDICT_REPLY,
     HUMAN_VERDICT_REPLY_LOCAL,
     NON_HUMAN_VERDICT_REPLY,
     NON_HUMAN_VERDICT_REPLY_LOCAL,
+    BouncerDecision,
 )
-from src.gateway import Gateway, REPLY_TEXT
+from src.gateway import GATEWAY_REPLY_RETRY_HINT, REPLY_TEXT, Gateway
 from src.interview_state import InterviewStateStore
 from src.interviewer import INTERVIEW_QUESTIONS, Interviewer
-from src.telegram_models import Chat, Message, PhotoSize, TelegramAPIError, TelegramFile, Update
+from src.telegram_models import (
+    Chat,
+    Message,
+    PhotoSize,
+    TelegramAPIError,
+    TelegramFile,
+    Update,
+)
 
 
 class GateClient:
@@ -248,7 +253,10 @@ def test_photo_without_bouncer_replies_unavailable_and_logs(caplog):
         replied = _poll(Gateway(client, bouncer=None))
 
     assert replied == 1
-    assert client.sent == [(777, BOUNCER_UNAVAILABLE_REPLY)]
+    assert client.sent == [
+        (777, BOUNCER_UNAVAILABLE_REPLY),
+        (777, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert any("event=photo_no_bouncer" in r.message for r in caplog.records)
 
 
@@ -261,7 +269,10 @@ def test_photo_download_failure_replies_unavailable_and_skips_bouncer(caplog):
         replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(888, BOUNCER_UNAVAILABLE_REPLY)]
+    assert client.sent == [
+        (888, BOUNCER_UNAVAILABLE_REPLY),
+        (888, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert bouncer.classify_calls == []  # gate stopped before the LLM
     assert bouncer.resets == []  # a failure never resets state (decision #4)
     assert any("event=photo_download_failed" in r.message for r in caplog.records)
@@ -279,7 +290,10 @@ def test_photo_get_file_without_path_treated_as_download_failure():
     replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(999, BOUNCER_UNAVAILABLE_REPLY)]
+    assert client.sent == [
+        (999, BOUNCER_UNAVAILABLE_REPLY),
+        (999, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert bouncer.classify_calls == []
     assert bouncer.resets == []
 
@@ -293,7 +307,10 @@ def test_empty_photo_list_is_gated_not_approved_as_text():
     replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(1515, BOUNCER_UNAVAILABLE_REPLY)]
+    assert client.sent == [
+        (1515, BOUNCER_UNAVAILABLE_REPLY),
+        (1515, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert bouncer.classify_calls == []
     assert bouncer.resets == []
 
@@ -313,7 +330,10 @@ def test_unexpected_download_failure_still_replies_gracefully(caplog):
         replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(1616, BOUNCER_UNAVAILABLE_REPLY)]
+    assert client.sent == [
+        (1616, BOUNCER_UNAVAILABLE_REPLY),
+        (1616, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert bouncer.classify_calls == []
     assert bouncer.resets == []
     assert any("event=photo_download_failed" in r.message for r in caplog.records)
@@ -328,7 +348,10 @@ def test_photo_classify_failure_replies_unavailable_without_reset(caplog):
         replied = _poll(Gateway(client, bouncer=bouncer))
 
     assert replied == 1
-    assert client.sent == [(1010, BOUNCER_UNAVAILABLE_REPLY)]
+    assert client.sent == [
+        (1010, BOUNCER_UNAVAILABLE_REPLY),
+        (1010, GATEWAY_REPLY_RETRY_HINT),
+    ]
     assert bouncer.resets == []  # unknown verdict → no state reset
     assert any("event=photo_classify_failed" in r.message for r in caplog.records)
 
@@ -361,7 +384,11 @@ def test_loop_survives_photo_gate_problems_and_keeps_polling():
 
     assert gateway.poll_once() == 1  # photo: graceful unavailable
     assert gateway.poll_once() == 1  # following text batch: normal reply
-    assert client.sent == [(1212, BOUNCER_UNAVAILABLE_REPLY), (1313, REPLY_TEXT)]
+    assert client.sent == [
+        (1212, BOUNCER_UNAVAILABLE_REPLY),
+        (1212, GATEWAY_REPLY_RETRY_HINT),
+        (1313, REPLY_TEXT),
+    ]
 
 
 def test_offset_advances_even_for_rejected_photo():
